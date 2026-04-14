@@ -381,41 +381,49 @@ class TrainerV2Curriculum:
         cfg = self.cfg
         print(f"\n{'='*60}")
         print(f"PHASE 3: Joint SupCon + CE | {cfg.EPOCHS_P3} epochs | backbone UNFROZEN")
-        print(f"         α ramps from {cfg.ALPHA_START} → {cfg.ALPHA_END}")
+        print(f"         alpha ramps from {cfg.ALPHA_START} -> {cfg.ALPHA_END}")
         print(f"{'='*60}")
 
-        # Rebuild model: prototype + FC (dual head) hoặc prototype only
-        if cfg.USE_DUAL_HEAD:
-            self.model = MalariaProtoCLFv2(
-                backbone_name  = cfg.BACKBONE,
-                num_classes    = cfg.NUM_CLASSES,
-                proj_dim       = cfg.PROJ_DIM,
-                use_prototype  = True,
-                use_dual_head  = True,
-                pretrained     = False,
-                proto_init     = proto_init,
-                blend_alpha    = cfg.BLEND_ALPHA,
-                dropout        = cfg.DROPOUT,
-            ).to(self.device)
-            self.model.load_state_dict(self.best_state, strict=False)
-        else:
-            self.model = MalariaProtoCLFv2(
-                backbone_name  = cfg.BACKBONE,
-                num_classes    = cfg.NUM_CLASSES,
-                proj_dim       = cfg.PROJ_DIM,
-                use_prototype  = True,
-                pretrained     = False,
-                proto_init     = proto_init,
-                dropout        = cfg.DROPOUT,
-            ).to(self.device)
-            # Load Phase 2 weights (backbone + proj_head + clf_head)
-            sd = self.best_state
-            # strip FC-only params nếu có
-            self.model.load_state_dict(sd, strict=False)
+        # Build Phase 3 model: MUST match Phase 2 structure (PrototypeHead).
+        # USE_DUAL_HEAD only for comparison runs, not as default.
+        self.model = MalariaProtoCLFv2(
+            backbone_name  = cfg.BACKBONE,
+            num_classes    = cfg.NUM_CLASSES,
+            proj_dim       = cfg.PROJ_DIM,
+            use_prototype  = True,
+            use_dual_head  = cfg.USE_DUAL_HEAD,
+            pretrained     = False,   # weights loaded below
+            proto_init     = proto_init,  # keep same init from Phase 2
+            blend_alpha    = cfg.BLEND_ALPHA,
+            dropout        = cfg.DROPOUT,
+        ).to(self.device)
+
+        # ── Safe weight loading ──────────────────────────────────
+        # Only load keys that exist in BOTH Phase 2 and Phase 3 models.
+        # Phase 2 clf_head = PrototypeHead → keys: "clf_head.prototypes"
+        # Phase 3 clf_head = PrototypeHead → same keys: "clf_head.prototypes"  ✓
+        # Phase 3 clf_head = DualHeadCLF  → keys: "clf_head.proto_head.prototypes"
+        #                                              "clf_head.fc_head.0.weight"
+        p2_state = self.best_state
+        p3_state  = self.model.state_dict()
+
+        loaded_keys, skipped_keys = [], []
+        for key in list(p2_state.keys()):
+            if key in p3_state:
+                p3_state[key] = p2_state[key]
+                loaded_keys.append(key)
+            else:
+                skipped_keys.append(key)
+
+        self.model.load_state_dict(p3_state)
+        print(f"[Phase 3] Loaded {len(loaded_keys)} compatible keys from Phase 2")
+        if skipped_keys:
+            print(f"[Phase 3] Skipped {len(skipped_keys)} keys: {skipped_keys[:3]}...")
 
         # Unfreeze backbone
         for param in self.model.backbone.parameters():
             param.requires_grad = True
+        print(f"[Phase 3] Backbone unfrozen, prototype weights preserved")
 
         self._setup_loss(classification_loss="focal")
 
@@ -430,16 +438,16 @@ class TrainerV2Curriculum:
         )
 
         for epoch in range(1, cfg.EPOCHS_P3 + 1):
-            # Alpha ramp-up
-            alpha = cfg.ALPHA_START + (cfg.ALPHA_END - cfg.ALPHA_START) * (epoch - 1) / max(cfg.EPOCHS_P3 - 1, 1)
+            alpha = cfg.ALPHA_START + (cfg.ALPHA_END - cfg.ALPHA_START) * \
+                    (epoch - 1) / max(cfg.EPOCHS_P3 - 1, 1)
             t_loss, t_sc, t_clf = self._train_epoch_phase3(epoch, alpha)
             v_loss, macro_f1 = self._val_epoch_phase3()
 
             if epoch > 1:
                 self.scheduler.step()
 
-            self._log_epoch("P3", epoch, cfg.TOTAL_EPOCHS, t_loss, v_loss, macro_f1, alpha=alpha,
-                            extra=f"SC:{t_sc:.4f} CLF:{t_clf:.4f}")
+            self._log_epoch("P3", epoch, cfg.TOTAL_EPOCHS, t_loss, v_loss, macro_f1,
+                            alpha=alpha, extra=f"SC:{t_sc:.4f} CLF:{t_clf:.4f}")
 
             if macro_f1 > self.best_metric:
                 self.best_metric = macro_f1

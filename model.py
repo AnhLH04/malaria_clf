@@ -182,10 +182,11 @@ class MalariaProtoCLFv2(nn.Module):
                 init_prototypes=proto_init,
             )
         else:
+            # FC head operates on projection space (proj_dim=128)
             self.clf_head = nn.Sequential(
-                nn.LayerNorm(feat_dim),
+                nn.LayerNorm(proj_dim),
                 nn.Dropout(dropout),
-                nn.Linear(feat_dim, num_classes),
+                nn.Linear(proj_dim, num_classes),
             )
 
         self.use_prototype = use_prototype
@@ -198,6 +199,9 @@ class MalariaProtoCLFv2(nn.Module):
         x: (B, 3, H, W)
         return_both_logits: True → DualHeadCLF trả về cả proto + fc logits
         Returns: (proj_feats, logits) hoặc (proj_feats, logits, proto_logits, fc_logits)
+
+        NOTE: When use_prototype=False, clf_head is FC(proj_dim → num_classes)
+              so we always pass proj_feats (128-dim) to clf_head.
         """
         feats      = self.backbone(x)
         proj_feats = self.proj_head(feats)
