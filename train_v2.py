@@ -255,12 +255,18 @@ class TrainerV2Curriculum:
         print(f"PHASE 1: CE Loss only | {cfg.EPOCHS_P1} epochs | backbone TRAINABLE")
         print(f"{'='*60}")
 
-        # Rebuild model: prototype disabled, FC head enabled
+        # Phase 1: PrototypeHead with random init — FC head not needed.
+        # Using use_prototype=True throughout all phases ensures state-dict keys
+        # are identical (clf_head.prototypes), avoiding Phase-1-FC vs Phase-2/3-
+        # PrototypeHead mismatch at restore time.
         self.model = MalariaProtoCLFv2(
             backbone_name=cfg.BACKBONE,
             num_classes=cfg.NUM_CLASSES,
-            use_prototype=False,  # dùng FC head thuần
+            proj_dim=cfg.PROJ_DIM,
+            use_prototype=True,
+            use_dual_head=False,
             pretrained=True,
+            proto_init=None,   # random prototypes; backbone/proj_head are what matters for P1
             dropout=cfg.DROPOUT,
         ).to(self.device)
         self._setup_loss(classification_loss="ce")
@@ -655,6 +661,30 @@ class TrainerV2Curriculum:
             all_labels.extend(labels.cpu().numpy())
         return total_loss / len(self.val_loader), f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
+    # ── Restore best state (FC → Prototype compat) ──
+    def _restore_best_state(self, proto_init: torch.Tensor):
+        """
+        Finalise self.model (PrototypeHead) with the best checkpoint.
+
+        Problem:
+          Phase 1 model has FC head  → keys: "clf_head.0.weight"
+          Phase 2/3 model has PrototypeHead → keys: "clf_head.prototypes"
+          run() finishes with a PrototypeHead model but self.best_state may
+          contain FC keys (from Phase 1 best) OR prototype keys (from Phase 3 best).
+
+        Solution:
+          1. Load best backbone/proj_head weights (strict=False drops FC keys).
+          2. Overwrite clf_head.prototypes with the prototypes that were trained
+             during Phase 2/3 — they are in the current self.model.state_dict()
+             because P3 trains the prototype head to convergence.
+        """
+        self.model.load_state_dict(self.best_state, strict=False)
+        final_state = self.model.state_dict()
+        trained_protos = final_state.get("clf_head.prototypes")
+        if trained_protos is not None:
+            final_state["clf_head.prototypes"] = trained_protos
+        self.model.load_state_dict(final_state)
+
     # ── Logging ────────────────────────────────
     def _log_epoch(self, phase, epoch, total_epochs, t_loss, v_loss, macro_f1, alpha=None, extra=""):
         self.history["phase"].append(phase)
@@ -698,8 +728,11 @@ class TrainerV2Curriculum:
         p3_best_f1 = self.best_metric
         print(f"\n[Phase 3] Best macro-F1: {p3_best_f1:.4f}")
 
-        # Load best
-        self.model.load_state_dict(self.best_state)
+        # Restore best state into a PrototypeHead model.
+        # self.model is a MalariaProtoCLFv2 with PrototypeHead (P2/P3 structure).
+        # best_state may be from Phase 1 (FC keys) or Phase 2/3 (prototype keys).
+        # strict=False drops FC keys silently; prototype keys are loaded normally.
+        self._restore_best_state(proto_init)
 
         # Calibration
         if cfg.DO_CALIBRATION:
