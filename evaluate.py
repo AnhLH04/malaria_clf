@@ -72,7 +72,9 @@ def load_model(checkpoint_path, device):
         state_dict = ckpt
 
     model = build_model(model_cfg)
-    model.load_state_dict(state_dict)
+    # [BUGFIX] strict=False prevents RuntimeError when checkpoint has FC keys
+    # (clf_head.0.weight) but model uses PrototypeHead (clf_head.prototypes).
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     model.to(device)
 
