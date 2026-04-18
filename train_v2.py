@@ -86,39 +86,42 @@ class TrainConfigV2:
 
     # ── Training phases ──
     EPOCHS_P1 = 15  # Phase 1: CE only (backbone + FC head)
-    EPOCHS_P2 = 10  # Phase 2: train prototype (backbone frozen)
-    EPOCHS_P3 = 35  # Phase 3: joint + unfreeze
-    TOTAL_EPOCHS = 60  # EPOCHS_P1 + EPOCHS_P2 + EPOCHS_P3
+    EPOCHS_P2 = 15  # Phase 2: train prototype (backbone very-low LR)
+    EPOCHS_P3 = 25  # Phase 3: joint + unfreeze
+    TOTAL_EPOCHS = 55  # EPOCHS_P1 + EPOCHS_P2 + EPOCHS_P3
 
     BATCH_SIZE = 32
     LR_P1 = 3e-4  # Phase 1 LR
-    LR_P2 = 2e-4  # Phase 2 LR (prototype head)
+    LR_P2_HEAD = 5e-4  # Phase 2 LR (prototype head)
+    LR_P2_BACKBONE = 1e-6  # Phase 2: backbone very-low LR (nearly frozen)
     LR_P3_BACKBONE = 3e-5  # Phase 3 LR for backbone
     LR_P3_HEAD = 2e-4  # Phase 3 LR for heads
     WEIGHT_DECAY = 1e-4
 
+    # ── Phase 3 warmup ──
+    P3_WARMUP_EPOCHS = 3  # Linear warmup for backbone LR in Phase 3
+
     # ── Loss ──
     SUPCON_TEMP = 0.07
-    ALPHA_START = 0.30  # SupCon weight start (Phase 3) — was 0.05, raised for stronger contrastive signal
-    ALPHA_END   = 0.80  # SupCon weight end (Phase 3)   — was 0.20, raised for stronger contrastive signal
-    # SC loss was stuck at ~1.75 with old α range (0.05–0.20) — gradient too weak vs CE.
-    # New range (0.30–0.80) ensures SupCon has meaningful contribution from the start.
+    ALPHA_START = 0.05  # SupCon weight start (Phase 3) — lightweight, fine-tune focus
+    ALPHA_END   = 0.15  # SupCon weight end (Phase 3)   — stays gentle to not overpower CE
 
     # ── Phase 3 loss balance ──
     USE_LOSS_NORMALIZATION = True  # Normalize SC loss by its running mean to balance gradient magnitude
     SUPCON_TARGET = 0.50  # Target SupCon loss value — used for loss normalization
 
-    # ── Phase 2 improvements ──
-    P2_SUPCON_ONLY   = True   # Phase 2 uses SupCon-only (no CE) to learn embedding space first
-    P2_CLF_EPOCHS    = 3      # Brief CE fine-tune after SupCon phase in P2
+    # ── Phase 2 structure ──
+    # P2a: SupCon + PushLoss epochs = P2_CLF_EPOCHS + 2 (min 2)
+    # P2b: CE/Focal fine-tune remaining epochs
+    P2_CLF_EPOCHS    = 5      # Brief CE fine-tune epochs within Phase 2
 
     # ── Early stopping ──
-    EARLY_STOP_PATIENCE = 8   # epochs with no improvement before stopping
+    EARLY_STOP_PATIENCE = 10  # increased from 8 for more tolerance
     EARLY_STOP_MIN_DELTA = 0.002  # improvement threshold
     EARLY_STOP_SMOOTH    = 5   # smoothing window for F1 tracking
 
-    # ── Prototype push loss ──
-    PUSH_LOSS_WEIGHT = 0.05  # weight for inter-class prototype separation loss
+    # ── Prototype push loss (used in both Phase 2 and Phase 3) ──
+    PUSH_LOSS_WEIGHT = 0.1  # increased from 0.05 for stronger inter-class separation
 
     CLF_LOSS_P1 = "ce"  # Phase 1: standard CE
     CLF_LOSS_P3 = "focal"  # Phase 3: focal (class imbalance)
@@ -255,18 +258,17 @@ class TrainerV2Curriculum:
         print(f"PHASE 1: CE Loss only | {cfg.EPOCHS_P1} epochs | backbone TRAINABLE")
         print(f"{'='*60}")
 
-        # Phase 1: PrototypeHead with random init — FC head not needed.
-        # Using use_prototype=True throughout all phases ensures state-dict keys
-        # are identical (clf_head.prototypes), avoiding Phase-1-FC vs Phase-2/3-
-        # PrototypeHead mismatch at restore time.
+        # Phase 1: FC head only (use_prototype=False).
+        # Backbone + proj_head learn strong representations via CE loss.
+        # Prototypes are computed AFTER training from trained embeddings.
         self.model = MalariaProtoCLFv2(
             backbone_name=cfg.BACKBONE,
             num_classes=cfg.NUM_CLASSES,
             proj_dim=cfg.PROJ_DIM,
-            use_prototype=True,
+            use_prototype=False,  # FC head — clean baseline, no prototype interference
             use_dual_head=False,
             pretrained=True,
-            proto_init=None,   # random prototypes; backbone/proj_head are what matters for P1
+            proto_init=None,
             dropout=cfg.DROPOUT,
         ).to(self.device)
         self._setup_loss(classification_loss="ce")
@@ -358,7 +360,7 @@ class TrainerV2Curriculum:
         p2_clf_epochs    = cfg.EPOCHS_P2
 
         print(f"\n{'='*60}")
-        print(f"PHASE 2: Prototype Training | {cfg.EPOCHS_P2} epochs | backbone FROZEN")
+        print(f"PHASE 2: Prototype Training | {cfg.EPOCHS_P2} epochs | backbone VERY-LOW LR")
         print(f"         Prototype init: class-mean from Phase-1 embeddings")
         print(f"         P2a: SupCon+PushLoss  ({p2_supcon_epochs} ep)")
         print(f"         P2b: CE/Focal fine-tune ({p2_clf_epochs - p2_supcon_epochs} ep)")
@@ -370,18 +372,31 @@ class TrainerV2Curriculum:
             num_classes=cfg.NUM_CLASSES,
             proj_dim=cfg.PROJ_DIM,
             use_prototype=True,
-            pretrained=True,
+            pretrained=False,  # weights loaded below
             proto_init=proto_init,
             dropout=cfg.DROPOUT,
         ).to(self.device)
 
-        # Freeze backbone throughout Phase 2
+        # Load Phase 1 best weights (backbone + proj_head), then load prototypes
+        p1_state = self.best_state
+        p2_state = self.model.state_dict()
+        loaded_keys, skipped_keys = [], []
+        for key in list(p1_state.keys()):
+            if key in p2_state:
+                p2_state[key] = p1_state[key]
+                loaded_keys.append(key)
+            else:
+                skipped_keys.append(key)
+        self.model.load_state_dict(p2_state, strict=False)
+        print(f"[Phase 2] Loaded {len(loaded_keys)} keys from Phase 1, skipped {len(skipped_keys)} (FC head)")
+
+        # Freeze backbone throughout Phase 2; only train prototype + proj_head
         for param in self.model.backbone.parameters():
             param.requires_grad = False
 
         self.optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=cfg.LR_P2,
+            lr=cfg.LR_P2_HEAD,
             weight_decay=cfg.WEIGHT_DECAY,
         )
 
@@ -400,7 +415,7 @@ class TrainerV2Curriculum:
             for epoch in range(1, p2_supcon_epochs + 1):
                 p2_global_epoch += 1
                 t_loss, t_sc, t_push = self._train_epoch_phase2a(epoch)
-                v_loss, macro_f1 = self._val_epoch_phase2()
+                v_loss, macro_f1 = self._val_epoch_phase2(loss_fn=self.ce_criterion)
 
                 if epoch > 1:
                     self.scheduler.step()
@@ -430,7 +445,7 @@ class TrainerV2Curriculum:
             for epoch in range(1, p2b_epochs + 1):
                 p2_global_epoch += 1
                 t_loss, t_clf = self._train_epoch_phase2b(epoch)
-                v_loss, macro_f1 = self._val_epoch_phase2()
+                v_loss, macro_f1 = self._val_epoch_phase2(loss_fn=self.clf_loss)
 
                 if epoch > 1:
                     self.scheduler.step()
@@ -492,15 +507,19 @@ class TrainerV2Curriculum:
         return total_loss / max(n, 1), total_clf / max(n, 1)
 
     @torch.no_grad()
-    def _val_epoch_phase2(self):
+    def _val_epoch_phase2(self, loss_fn=None):
+        """Pass loss_fn so validation metric matches the training objective."""
         from sklearn.metrics import f1_score
+
+        if loss_fn is None:
+            loss_fn = self.clf_loss
 
         self.model.eval()
         total_loss, all_preds, all_labels = 0.0, [], []
         for imgs, labels in self.val_loader:
             imgs, labels = imgs.to(self.device), labels.to(self.device)
             _, logits = self.model(imgs)
-            loss = self.clf_loss(logits, labels)
+            loss = loss_fn(logits, labels)
             total_loss += loss.item()
             all_preds.extend(logits.argmax(1).cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -552,7 +571,7 @@ class TrainerV2Curriculum:
             else:
                 skipped_keys.append(key)
 
-        self.model.load_state_dict(p3_state)
+        self.model.load_state_dict(p3_state, strict=False)  # strict=False: handle FC→Prototype mismatch
         print(f"[Phase 3] Loaded {len(loaded_keys)} compatible keys from Phase 2")
         if skipped_keys:
             print(f"[Phase 3] Skipped {len(skipped_keys)} keys: {skipped_keys[:3]}...")
@@ -562,10 +581,15 @@ class TrainerV2Curriculum:
             param.requires_grad = True
         print(f"[Phase 3] Backbone unfrozen, prototype weights preserved")
 
-        # Loss: SupCon normalized + Focal + prototype push
+        # Loss: SupCon + Focal + prototype push.
+        # IMPORTANT: normalize_supcon=False in Phase 3 because:
+        #   1. alpha (0.05→0.15) is the primary SC weight control.
+        #   2. normalize_loss=True interacts badly with external alpha scaling
+        #      (alpha * normalized_l_sc, where normalize changes l_sc magnitude).
+        #   3. Phase 2 already learned a good embedding space; Phase 3 just fine-tunes.
         self._setup_loss(
             classification_loss="focal",
-            normalize_supcon=cfg.USE_LOSS_NORMALIZATION,
+            normalize_supcon=False,  # alpha controls SC weight directly
         )
 
         self.optimizer = torch.optim.AdamW(
@@ -576,11 +600,32 @@ class TrainerV2Curriculum:
             ],
             weight_decay=cfg.WEIGHT_DECAY,
         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=cfg.EPOCHS_P3,
-            eta_min=1e-6,
-        )
+
+        # Warmup + Cosine schedule for backbone LR
+        warmup_epochs = cfg.P3_WARMUP_EPOCHS
+        if warmup_epochs > 0:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=0.1,  # start at 10% of target LR
+                total_iters=warmup_epochs,
+                # attaches to the backbone param group (index 0)
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=cfg.EPOCHS_P3 - warmup_epochs,
+                eta_min=1e-6,
+            )
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs],
+            )
+        else:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=cfg.EPOCHS_P3,
+                eta_min=1e-6,
+            )
 
         # Smoothed early stopping
         es = SmoothedEarlyStopping(
