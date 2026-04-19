@@ -81,7 +81,15 @@ class DynamicFocalLoss(nn.Module):
     gamma_min / gamma_max: clamp range for computed gamma values.
     """
 
-    def __init__(self, num_classes, class_counts=None, gamma_min=0.5, gamma_max=5.0, reduction="mean"):
+    def __init__(
+        self,
+        num_classes,
+        class_counts=None,
+        class_weights=None,
+        gamma_min=0.5,
+        gamma_max=5.0,
+        reduction="mean",
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.reduction = reduction
@@ -98,6 +106,14 @@ class DynamicFocalLoss(nn.Module):
 
         self.register_buffer("gammas", gammas)
 
+        if class_weights is not None:
+            weights = torch.tensor(class_weights, dtype=torch.float)
+            # Keep average weight near 1.0 to avoid exploding loss scale.
+            weights = weights / weights.mean().clamp_min(1e-9)
+        else:
+            weights = torch.ones(num_classes, dtype=torch.float)
+        self.register_buffer("class_weights", weights)
+
     def forward(self, logits, targets):
         """logits: (B, C), targets: (B,)"""
         probs = F.softmax(logits, dim=1)
@@ -106,10 +122,11 @@ class DynamicFocalLoss(nn.Module):
         # gather p_t and gamma for each sample's true class
         p_t = probs.gather(1, targets.view(-1, 1)).squeeze(1)  # (B,)
         gamma_t = self.gammas[targets]  # (B,)
+        alpha_t = self.class_weights[targets]  # (B,)
 
         focal_weight = (1.0 - p_t) ** gamma_t
         ce_loss = -log_probs.gather(1, targets.view(-1, 1)).squeeze(1)
-        loss = focal_weight * ce_loss
+        loss = alpha_t * focal_weight * ce_loss
 
         if self.reduction == "mean":
             return loss.mean()

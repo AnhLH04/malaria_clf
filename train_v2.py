@@ -63,6 +63,9 @@ class TrainConfigV2:
     # Useful when you already have a strong baseline fine-tuned checkpoint.
     INIT_FROM_CHECKPOINT = "/kaggle/input/datasets/hoanganh04/classification-models/convnext_tiny.pth"
     SKIP_PHASE1_IF_INIT = True
+    INIT_ADAPT_EPOCHS = 2  # short adaptation to train proj_head before proto init
+    INIT_ADAPT_LR = 1e-3
+    INIT_ADAPT_BACKBONE_LR = 5e-6
 
     # ── Model ─────────────────────────────────────────────────────────────
     BACKBONE = "convnext_tiny.in22k_ft_in1k"
@@ -81,11 +84,11 @@ class TrainConfigV2:
 
     # ── ProtoCLR Fine-Tune (Phase 2) ───────────────────────────────────────
     USE_PROTOCLR = True  # run ProtoCLR fine-tune after Phase 1
-    PROTOCLR_EPOCHS = 15
-    PROTOCLR_LR_HEAD = 5e-4
-    PROTOCLR_LR_BACK = 1e-5  # slightly higher to allow backbone fine-tuning
-    PROTOCLR_ALPHA = 0.5  # SupCon weight (50% SupCon, 50% CE) - increased from 0.3
-    PUSH_WEIGHT = 0.2  # prototype push-away loss weight (increased from 0.1)
+    PROTOCLR_EPOCHS = 10
+    PROTOCLR_LR_HEAD = 2e-4
+    PROTOCLR_LR_BACK = 5e-6
+    PROTOCLR_ALPHA = 0.25  # prioritize classification signal for parasite recall
+    PUSH_WEIGHT = 0.08
     PROTOCLR_CLF_LOSS = "focal"  # "focal" | "ce" | "asymmetric_ce"
     PROTOCLR_LABEL_SMOOTHING = 0.0  # only used when PROTOCLR_CLF_LOSS="ce"
 
@@ -93,6 +96,11 @@ class TrainConfigV2:
     SUPCON_TEMP = 0.07
     CLF_LOSS = "focal"  # "focal" | "ce" | "asymmetric_ce"
     MAJORITY_CLASS = 4  # Unparasitized
+    FOCAL_USE_CLASS_WEIGHTS = True
+    FOCAL_CLASS_WEIGHT_POWER = 0.5
+
+    # Select checkpoint by global macro-F1 or parasite-only macro-F1 (classes 0..3)
+    BEST_MODEL_METRIC = "parasite_macro_f1"  # "macro_f1" | "parasite_macro_f1"
 
     # ── Early stopping ────────────────────────────────────────────────────
     EARLY_STOP_PATIENCE = 8
@@ -163,6 +171,8 @@ class TrainerV2SinglePhase:
             "train_loss": [],
             "val_loss": [],
             "val_macro_f1": [],
+            "val_parasite_f1": [],
+            "val_monitor": [],
             "alpha": [],
             "phase_desc": [],
         }
@@ -197,6 +207,20 @@ class TrainerV2SinglePhase:
         labels = [lbl for _, lbl in self.train_ds.samples]
         counts = Counter(labels)
         return [counts.get(i, 1) for i in range(self.cfg.NUM_CLASSES)]
+
+    def _build_class_weights(self, power: float | None = None):
+        """Inverse-frequency class weights (normalized around 1.0)."""
+        if power is None:
+            power = self.cfg.FOCAL_CLASS_WEIGHT_POWER
+        counts = torch.tensor(self.class_counts, dtype=torch.float)
+        weights = (counts.sum() / counts.clamp_min(1.0)) ** power
+        weights = weights / weights.mean().clamp_min(1e-9)
+        return weights.tolist()
+
+    def _select_monitor(self, macro_f1: float, parasite_f1: float):
+        if self.cfg.BEST_MODEL_METRIC == "parasite_macro_f1":
+            return parasite_f1
+        return macro_f1
 
     # ── External checkpoint bootstrap ─────────────────────────────────────
     def _extract_state_dict(self, ckpt_obj):
@@ -268,11 +292,46 @@ class TrainerV2SinglePhase:
 
         # Evaluate this initialization once on val to set best metric/state baseline.
         self._setup_loss(classification_loss=cfg.CLF_LOSS, label_smoothing=cfg.LABEL_SMOOTHING)
-        v_loss, macro_f1 = self._val_epoch_phase1()
-        self.best_metric = macro_f1
+
+        if cfg.INIT_ADAPT_EPOCHS > 0:
+            print(
+                f"[Init] Adaptation stage: {cfg.INIT_ADAPT_EPOCHS}ep | "
+                f"head_lr={cfg.INIT_ADAPT_LR} back_lr={cfg.INIT_ADAPT_BACKBONE_LR}"
+            )
+            adapt_groups = [
+                {"params": self.model.proj_head.parameters(), "lr": cfg.INIT_ADAPT_LR},
+                {"params": self.model.clf_head.parameters(), "lr": cfg.INIT_ADAPT_LR},
+            ]
+            if cfg.INIT_ADAPT_BACKBONE_LR > 0:
+                adapt_groups.append({"params": self.model.backbone.parameters(), "lr": cfg.INIT_ADAPT_BACKBONE_LR})
+
+            self.optimizer = torch.optim.AdamW(adapt_groups, weight_decay=cfg.WEIGHT_DECAY)
+            adapt_best = float("-inf")
+            adapt_best_state = copy.deepcopy(self.model.state_dict())
+
+            for ep in range(1, cfg.INIT_ADAPT_EPOCHS + 1):
+                t_loss = self._train_epoch_phase1(ep)
+                v_loss, macro_f1, parasite_f1 = self._val_epoch_phase1()
+                monitor = self._select_monitor(macro_f1, parasite_f1)
+                print(
+                    f"[InitAdapt] {ep:02d}/{cfg.INIT_ADAPT_EPOCHS} | "
+                    f"T {t_loss:.4f} | V {v_loss:.4f} | "
+                    f"F1m {macro_f1:.4f} F1p {parasite_f1:.4f}"
+                )
+                if monitor > adapt_best:
+                    adapt_best = monitor
+                    adapt_best_state = copy.deepcopy(self.model.state_dict())
+
+            self.model.load_state_dict(adapt_best_state, strict=False)
+
+        v_loss, macro_f1, parasite_f1 = self._val_epoch_phase1()
+        self.best_metric = self._select_monitor(macro_f1, parasite_f1)
         self.best_state = copy.deepcopy(self.model.state_dict())
         torch.save(self.best_state, os.path.join(cfg.OUTPUT_DIR, "phase1_best_from_init.pth"))
-        print(f"[Init] Val from external init | V {v_loss:.4f} | F1 {macro_f1:.4f}")
+        print(
+            f"[Init] Val from external init | V {v_loss:.4f} | "
+            f"F1m {macro_f1:.4f} F1p {parasite_f1:.4f} | monitor {self.best_metric:.4f}"
+        )
 
         if not cfg.USE_PROTOCLR:
             return None
@@ -296,7 +355,12 @@ class TrainerV2SinglePhase:
             label_smoothing = cfg.LABEL_SMOOTHING
 
         if classification_loss == "focal":
-            self.clf_loss = DynamicFocalLoss(cfg.NUM_CLASSES, self.class_counts).to(self.device)
+            class_weights = self._build_class_weights() if cfg.FOCAL_USE_CLASS_WEIGHTS else None
+            self.clf_loss = DynamicFocalLoss(
+                cfg.NUM_CLASSES,
+                class_counts=self.class_counts,
+                class_weights=class_weights,
+            ).to(self.device)
         elif classification_loss == "ce":
             self.clf_loss = nn.CrossEntropyLoss(
                 label_smoothing=label_smoothing,
@@ -351,20 +415,20 @@ class TrainerV2SinglePhase:
 
         for epoch in range(1, cfg.EPOCHS + 1):
             t_loss = self._train_epoch_phase1(epoch)
-            v_loss, macro_f1 = self._val_epoch_phase1()
+            v_loss, macro_f1, parasite_f1 = self._val_epoch_phase1()
+            monitor = self._select_monitor(macro_f1, parasite_f1)
 
             if epoch > 1:
                 self.scheduler.step()
 
-            self._log_epoch("P1", epoch, cfg.EPOCHS, t_loss, v_loss, macro_f1, alpha=None)
+            self._log_epoch("P1", epoch, cfg.EPOCHS, t_loss, v_loss, macro_f1, parasite_f1, monitor, alpha=None)
 
-            if macro_f1 > self.best_metric:
-                self.best_metric = macro_f1
+            if monitor > self.best_metric:
+                self.best_metric = monitor
                 self.best_state = copy.deepcopy(self.model.state_dict())
                 torch.save(self.best_state, os.path.join(cfg.OUTPUT_DIR, "phase1_best.pth"))
 
-        p1_f1 = self.best_metric
-        print(f"\n[Phase 1] Best macro-F1: {p1_f1:.4f}")
+        print(f"\n[Phase 1] Best monitor ({cfg.BEST_MODEL_METRIC}): {self.best_metric:.4f}")
 
         # Compute class-mean prototypes for Phase 2 (if enabled)
         if cfg.USE_PROTOCLR:
@@ -435,7 +499,9 @@ class TrainerV2SinglePhase:
             total_loss += loss.item()
             all_preds.extend(logits.argmax(1).cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-        return total_loss / len(self.val_loader), f1_score(all_labels, all_preds, average="macro", zero_division=0)
+        macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+        parasite_f1 = f1_score(all_labels, all_preds, labels=[0, 1, 2, 3], average="macro", zero_division=0)
+        return total_loss / len(self.val_loader), macro_f1, parasite_f1
 
     # ── Phase 2: ProtoCLR fine-tune ────────────────────────────────────────
     def _run_phase2(self, proto_init):
@@ -514,7 +580,8 @@ class TrainerV2SinglePhase:
 
         for epoch in range(1, p2_epochs + 1):
             t_loss, t_sc, t_push = self._train_epoch_protoclr(epoch)
-            v_loss, macro_f1 = self._val_epoch_protoclr()
+            v_loss, macro_f1, parasite_f1 = self._val_epoch_protoclr()
+            monitor = self._select_monitor(macro_f1, parasite_f1)
 
             if epoch > 1:
                 self.scheduler.step()
@@ -526,18 +593,19 @@ class TrainerV2SinglePhase:
                 t_loss,
                 v_loss,
                 macro_f1,
+                parasite_f1,
+                monitor,
                 alpha=cfg.PROTOCLR_ALPHA,
                 extra=f"SC:{t_sc:.4f} push:{t_push:.4f}",
             )
 
             # [BUGFIX-1] Reset es counter AFTER saving best_state, not inside the if-block
-            if macro_f1 > self.best_metric:
-                self.best_metric = macro_f1
+            if monitor > self.best_metric:
+                self.best_metric = monitor
                 self.best_state = copy.deepcopy(self.model.state_dict())
                 torch.save(self.best_state, os.path.join(cfg.OUTPUT_DIR, "best_protoclr.pth"))
 
-        p2_f1 = self.best_metric
-        print(f"\n[Phase 2] Best macro-F1: {p2_f1:.4f}")
+        print(f"\n[Phase 2] Best monitor ({cfg.BEST_MODEL_METRIC}): {self.best_metric:.4f}")
 
     def _train_epoch_protoclr(self, epoch):
         """Combined SupCon + CE + PushLoss for ProtoCLR."""
@@ -585,24 +653,30 @@ class TrainerV2SinglePhase:
             total_loss += loss.item()
             all_preds.extend(logits.argmax(1).cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-        return total_loss / len(self.val_loader), f1_score(all_labels, all_preds, average="macro", zero_division=0)
+        macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+        parasite_f1 = f1_score(all_labels, all_preds, labels=[0, 1, 2, 3], average="macro", zero_division=0)
+        return total_loss / len(self.val_loader), macro_f1, parasite_f1
 
     # ── Logging ────────────────────────────────────────────────────────────
-    def _log_epoch(self, phase, epoch, total_epochs, t_loss, v_loss, macro_f1, alpha=None, extra=""):
+    def _log_epoch(
+        self, phase, epoch, total_epochs, t_loss, v_loss, macro_f1, parasite_f1, monitor, alpha=None, extra=""
+    ):
         self.history["phase"].append(phase)
         self.history["epoch"].append(epoch)
         self.history["train_loss"].append(t_loss)
         self.history["val_loss"].append(v_loss)
         self.history["val_macro_f1"].append(macro_f1)
+        self.history["val_parasite_f1"].append(parasite_f1)
+        self.history["val_monitor"].append(monitor)
         self.history["alpha"].append(alpha if alpha is not None else 0.0)
         self.history["phase_desc"].append(f"{phase} ep{epoch}")
 
-        tag = "✓ BEST" if macro_f1 >= self.best_metric else ""
+        tag = "✓ BEST" if monitor >= self.best_metric else ""
         alpha_str = f"α={alpha:.3f}" if alpha is not None else ""
         print(
             f"[{phase}] {epoch:03d}/{total_epochs} | "
             f"T {t_loss:.4f} {extra} | V {v_loss:.4f} | "
-            f"F1 {macro_f1:.4f} {alpha_str} {tag}"
+            f"F1m {macro_f1:.4f} F1p {parasite_f1:.4f} M {monitor:.4f} {alpha_str} {tag}"
         )
 
     # ── Main run ──────────────────────────────────────────────────────────
@@ -614,6 +688,10 @@ class TrainerV2SinglePhase:
         print(f"Malaria ProtoCLR Training | {cfg.BACKBONE}")
         print(f"  Phase 1: {cfg.EPOCHS}ep CE | ProtoCLR: {cfg.USE_PROTOCLR} ({cfg.PROTOCLR_EPOCHS}ep)")
         print(f"  Init ckpt: {cfg.INIT_FROM_CHECKPOINT if cfg.INIT_FROM_CHECKPOINT else 'None'}")
+        print(
+            f"  P2 cfg: alpha={cfg.PROTOCLR_ALPHA}, head_lr={cfg.PROTOCLR_LR_HEAD}, "
+            f"back_lr={cfg.PROTOCLR_LR_BACK}, push={cfg.PUSH_WEIGHT}, metric={cfg.BEST_MODEL_METRIC}"
+        )
         print(f"  Classes: {cfg.NUM_CLASSES} | Imbalance: {self.class_counts}")
         print(f"{'='*60}")
 
