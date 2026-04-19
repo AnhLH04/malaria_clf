@@ -384,9 +384,12 @@ class TrainerV2SinglePhase:
         # Set different LRs: backbone vs head+prototypes
         self.model = proto_model
 
-        # Separate parameter groups for differential learning rates
+        # Separate parameter groups for differential learning rates.
+        # Use `is` (identity) not `in` (value comparison) — tensors with the same
+        # values are NOT the same object, and dimension mismatch causes RuntimeError.
         backbone_params = [p for p in self.model.backbone.parameters() if p.requires_grad]
-        other_params = [p for p in self.model.parameters() if p not in backbone_params and p.requires_grad]
+        backbone_ids = {id(p) for p in backbone_params}
+        other_params = [p for p in self.model.parameters() if id(p) not in backbone_ids and p.requires_grad]
 
         self.optimizer = torch.optim.AdamW(
             [
