@@ -21,15 +21,15 @@ class SupConLoss(nn.Module):
         gradient magnitude with CE/focal loss in joint training.
       • Clips temperature-aware similarity to avoid overflow.
     """
-    def __init__(self, temperature=0.07, contrast_mode="all",
-                 normalize_loss=False, target_loss=0.5):
+
+    def __init__(self, temperature=0.07, contrast_mode="all", normalize_loss=False, target_loss=0.5):
         super().__init__()
-        self.temperature    = temperature
+        self.temperature = temperature
         self.contrast_mode = contrast_mode
         self.normalize_loss = normalize_loss
-        self.target_loss   = target_loss
+        self.target_loss = target_loss
         self.register_buffer("_run_mean", torch.tensor(0.0))
-        self._momentum     = 0.9
+        self._momentum = 0.9
 
     def forward(self, features, labels):
         """
@@ -80,15 +80,15 @@ class DynamicFocalLoss(nn.Module):
     class_counts: list/tensor of sample counts per class (used to set gamma).
     gamma_min / gamma_max: clamp range for computed gamma values.
     """
-    def __init__(self, num_classes, class_counts=None,
-                 gamma_min=0.5, gamma_max=5.0, reduction="mean"):
+
+    def __init__(self, num_classes, class_counts=None, gamma_min=0.5, gamma_max=5.0, reduction="mean"):
         super().__init__()
         self.num_classes = num_classes
-        self.reduction   = reduction
+        self.reduction = reduction
 
         if class_counts is not None:
             counts = torch.tensor(class_counts, dtype=torch.float)
-            freq   = counts / counts.sum()
+            freq = counts / counts.sum()
             # rarer class → higher gamma
             raw_gamma = 1.0 / (freq + 1e-9)
             raw_gamma = raw_gamma / raw_gamma.max() * gamma_max
@@ -104,12 +104,12 @@ class DynamicFocalLoss(nn.Module):
         log_probs = F.log_softmax(logits, dim=1)
 
         # gather p_t and gamma for each sample's true class
-        p_t     = probs.gather(1, targets.view(-1, 1)).squeeze(1)   # (B,)
-        gamma_t = self.gammas[targets]                               # (B,)
+        p_t = probs.gather(1, targets.view(-1, 1)).squeeze(1)  # (B,)
+        gamma_t = self.gammas[targets]  # (B,)
 
         focal_weight = (1.0 - p_t) ** gamma_t
-        ce_loss      = -log_probs.gather(1, targets.view(-1, 1)).squeeze(1)
-        loss         = focal_weight * ce_loss
+        ce_loss = -log_probs.gather(1, targets.view(-1, 1)).squeeze(1)
+        loss = focal_weight * ce_loss
 
         if self.reduction == "mean":
             return loss.mean()
@@ -126,10 +126,10 @@ class AsymmetricLabelSmoothingCE(nn.Module):
     smooth_majority: smoothing ε for majority class (default 0.2)
     smooth_minority: smoothing ε for minority classes (default 0.05)
     """
-    def __init__(self, num_classes, majority_class=4,
-                 smooth_majority=0.2, smooth_minority=0.05):
+
+    def __init__(self, num_classes, majority_class=4, smooth_majority=0.2, smooth_minority=0.05):
         super().__init__()
-        self.num_classes    = num_classes
+        self.num_classes = num_classes
         self.majority_class = majority_class
         # build per-class smoothing vector
         eps = torch.full((num_classes,), smooth_minority)
@@ -143,7 +143,7 @@ class AsymmetricLabelSmoothingCE(nn.Module):
         # one-hot with asymmetric label smoothing
         B, C = logits.shape
         smooth_targets = torch.zeros_like(log_probs)
-        eps_per_sample = self.eps[targets]           # (B,)
+        eps_per_sample = self.eps[targets]  # (B,)
 
         for i in range(B):
             e = eps_per_sample[i].item()
@@ -159,10 +159,10 @@ class CombinedLoss(nn.Module):
     Joint loss: alpha * SupConLoss + (1-alpha) * ClassificationLoss
     classification_loss: "focal" | "asymmetric_ce" | "ce"
     """
-    def __init__(self, num_classes, class_counts=None,
-                 supcon_temp=0.07, alpha=0.5,
-                 classification_loss="focal",
-                 majority_class=4):
+
+    def __init__(
+        self, num_classes, class_counts=None, supcon_temp=0.07, alpha=0.5, classification_loss="focal", majority_class=4
+    ):
         super().__init__()
         self.alpha = alpha
         self.supcon = SupConLoss(temperature=supcon_temp)
@@ -170,8 +170,7 @@ class CombinedLoss(nn.Module):
         if classification_loss == "focal":
             self.clf_loss = DynamicFocalLoss(num_classes, class_counts)
         elif classification_loss == "asymmetric_ce":
-            self.clf_loss = AsymmetricLabelSmoothingCE(
-                num_classes, majority_class=majority_class)
+            self.clf_loss = AsymmetricLabelSmoothingCE(num_classes, majority_class=majority_class)
         else:
             self.clf_loss = nn.CrossEntropyLoss()
 
@@ -182,9 +181,8 @@ class CombinedLoss(nn.Module):
         labels:     (B,)
         """
         loss_supcon = self.supcon(proj_feats, labels)
-        loss_clf    = self.clf_loss(logits, labels)
-        return self.alpha * loss_supcon + (1.0 - self.alpha) * loss_clf, \
-               loss_supcon.item(), loss_clf.item()
+        loss_clf = self.clf_loss(logits, labels)
+        return self.alpha * loss_supcon + (1.0 - self.alpha) * loss_clf, loss_supcon.item(), loss_clf.item()
 
 
 # ─────────────────────────────────────────────
@@ -201,6 +199,7 @@ class PrototypePushLoss(nn.Module):
     The loss is non-redundant with SupCon because SupCon operates on per-batch pairs,
     whereas this loss directly minimises inter-class prototype similarity globally.
     """
+
     def __init__(self, margin: float = 0.3, weight: float = 0.05):
         """
         Args:
@@ -217,12 +216,13 @@ class PrototypePushLoss(nn.Module):
         prototypes: (C, D) L2-normalized class prototype vectors.
         Returns: scalar push-loss (scaled by self.weight).
         """
-        P = F.normalize(prototypes, dim=1)           # (C, D)
-        sim = torch.matmul(P, P.T)                   # (C, C)
+        P = F.normalize(prototypes, dim=1)  # (C, D)
+        sim = torch.matmul(P, P.T)  # (C, C)
         # Zero out diagonal (self-similarity = 1.0 by definition)
         sim = sim - torch.eye(P.shape[0], device=P.device)
         # Penalise any pair with similarity above (1 - margin)
-        violation = torch.clamp_min(1.0 - self.margin - sim, min=0.0)
+        threshold = 1.0 - self.margin
+        violation = torch.clamp_min(sim - threshold, min=0.0)
         # Average over all off-diagonal pairs
         n_pairs = P.shape[0] * (P.shape[0] - 1)
         loss = violation.sum() / n_pairs
@@ -250,8 +250,9 @@ class SmoothedEarlyStopping:
                 break
             trainer.train()
     """
+
     def __init__(self, patience: int = 8, min_delta: float = 0.002, smoothing: int = 5):
-        self.patience  = patience
+        self.patience = patience
         self.min_delta = min_delta
         self.smoothing = smoothing
         self.history: list[float] = []
@@ -264,7 +265,7 @@ class SmoothedEarlyStopping:
         if len(self.history) < self.smoothing:
             return False
 
-        smoothed = sum(self.history[-self.smoothing:]) / self.smoothing
+        smoothed = sum(self.history[-self.smoothing :]) / self.smoothing
 
         if len(self.history) == self.smoothing:
             self._best_smoothed = smoothed
@@ -283,4 +284,3 @@ class SmoothedEarlyStopping:
     @property
     def best_smoothed(self) -> float:
         return getattr(self, "_best_smoothed", float("-inf"))
-

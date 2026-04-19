@@ -38,7 +38,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from calibration import TemperatureScaling
+from calibration import TemperatureScaling, sanitize_temperature
 from dataset import MalariaDataset, get_transforms
 from losses import DynamicFocalLoss, PrototypePushLoss, SupConLoss
 from model import MalariaProtoCLFv2, build_model, compute_class_prototypes
@@ -57,6 +57,12 @@ class TrainConfigV2:
     VAL_ANN = os.path.join(BASE_DIR, "val_annotation_5classes.txt")
     TEST_ANN = os.path.join(BASE_DIR, "test_annotation_5classes.txt")
     OUTPUT_DIR = "/kaggle/working/malaria_proto_v2"
+
+    # ── External baseline init (optional) ────────────────────────────────
+    # If set, trainer will load this checkpoint and skip Phase 1 training.
+    # Useful when you already have a strong baseline fine-tuned checkpoint.
+    INIT_FROM_CHECKPOINT = "/kaggle/input/datasets/hoanganh04/classification-models/convnext_tiny.pth"
+    SKIP_PHASE1_IF_INIT = True
 
     # ── Model ─────────────────────────────────────────────────────────────
     BACKBONE = "convnext_tiny.in22k_ft_in1k"
@@ -80,6 +86,8 @@ class TrainConfigV2:
     PROTOCLR_LR_BACK = 1e-5  # slightly higher to allow backbone fine-tuning
     PROTOCLR_ALPHA = 0.5  # SupCon weight (50% SupCon, 50% CE) - increased from 0.3
     PUSH_WEIGHT = 0.2  # prototype push-away loss weight (increased from 0.1)
+    PROTOCLR_CLF_LOSS = "focal"  # "focal" | "ce" | "asymmetric_ce"
+    PROTOCLR_LABEL_SMOOTHING = 0.0  # only used when PROTOCLR_CLF_LOSS="ce"
 
     # ── Loss ───────────────────────────────────────────────────────────────
     SUPCON_TEMP = 0.07
@@ -190,17 +198,108 @@ class TrainerV2SinglePhase:
         counts = Counter(labels)
         return [counts.get(i, 1) for i in range(self.cfg.NUM_CLASSES)]
 
+    # ── External checkpoint bootstrap ─────────────────────────────────────
+    def _extract_state_dict(self, ckpt_obj):
+        """Extract state_dict from common checkpoint formats."""
+        if isinstance(ckpt_obj, dict):
+            for key in ("model_state", "state_dict", "model", "net", "weights"):
+                value = ckpt_obj.get(key)
+                if isinstance(value, dict):
+                    return value
+            if all(isinstance(v, torch.Tensor) for v in ckpt_obj.values()):
+                return ckpt_obj
+        raise ValueError("Unsupported checkpoint format: cannot find a state_dict")
+
+    def _normalize_state_dict_keys(self, state_dict):
+        """Normalize keys by removing common wrappers like module./model."""
+        normalized = {}
+        for key, value in state_dict.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            new_key = key
+            for prefix in ("module.", "model.", "network."):
+                if new_key.startswith(prefix):
+                    new_key = new_key[len(prefix) :]
+            normalized[new_key] = value
+        return normalized
+
+    def _bootstrap_from_checkpoint(self, checkpoint_path):
+        """Load baseline checkpoint, build FC model, and compute prototypes for ProtoCLR."""
+        cfg = self.cfg
+        print(f"\n[Init] Loading external baseline checkpoint: {checkpoint_path}")
+
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        ext_state = self._normalize_state_dict_keys(self._extract_state_dict(ckpt))
+
+        # Build Phase-1-style model (FC head) and load as many keys as possible.
+        self.model = MalariaProtoCLFv2(
+            backbone_name=cfg.BACKBONE,
+            num_classes=cfg.NUM_CLASSES,
+            proj_dim=cfg.PROJ_DIM,
+            use_prototype=False,
+            use_dual_head=False,
+            pretrained=False,
+            proto_init=None,
+            dropout=cfg.DROPOUT,
+        ).to(self.device)
+
+        target_state = self.model.state_dict()
+        matched, skipped = 0, 0
+
+        for src_key, src_tensor in ext_state.items():
+            candidate_keys = [src_key]
+            if src_key.startswith("backbone."):
+                candidate_keys.append(src_key[len("backbone.") :])
+            else:
+                candidate_keys.append(f"backbone.{src_key}")
+
+            loaded = False
+            for dst_key in candidate_keys:
+                if dst_key in target_state and target_state[dst_key].shape == src_tensor.shape:
+                    target_state[dst_key] = src_tensor
+                    matched += 1
+                    loaded = True
+                    break
+            if not loaded:
+                skipped += 1
+
+        self.model.load_state_dict(target_state, strict=False)
+        print(f"[Init] Matched keys: {matched} | skipped: {skipped}")
+
+        # Evaluate this initialization once on val to set best metric/state baseline.
+        self._setup_loss(classification_loss=cfg.CLF_LOSS, label_smoothing=cfg.LABEL_SMOOTHING)
+        v_loss, macro_f1 = self._val_epoch_phase1()
+        self.best_metric = macro_f1
+        self.best_state = copy.deepcopy(self.model.state_dict())
+        torch.save(self.best_state, os.path.join(cfg.OUTPUT_DIR, "phase1_best_from_init.pth"))
+        print(f"[Init] Val from external init | V {v_loss:.4f} | F1 {macro_f1:.4f}")
+
+        if not cfg.USE_PROTOCLR:
+            return None
+
+        print("[Init] Computing class prototypes from external-initialized model...")
+        proto_init = compute_class_prototypes(
+            self.model,
+            self.train_loader,
+            self.device,
+            max_samples_per_class=2000,
+        )
+        print(f"[Init] Prototypes shape={proto_init.shape}, norms={proto_init.norm(dim=1).tolist()}")
+        return proto_init
+
     # ── Loss ───────────────────────────────────────────────────────────────
-    def _setup_loss(self, classification_loss=None):
+    def _setup_loss(self, classification_loss=None, label_smoothing=None):
         cfg = self.cfg
         if classification_loss is None:
             classification_loss = cfg.CLF_LOSS
+        if label_smoothing is None:
+            label_smoothing = cfg.LABEL_SMOOTHING
 
         if classification_loss == "focal":
             self.clf_loss = DynamicFocalLoss(cfg.NUM_CLASSES, self.class_counts).to(self.device)
         elif classification_loss == "ce":
             self.clf_loss = nn.CrossEntropyLoss(
-                label_smoothing=cfg.LABEL_SMOOTHING,
+                label_smoothing=label_smoothing,
             ).to(self.device)
         elif classification_loss == "asymmetric_ce":
             from losses import AsymmetricLabelSmoothingCE
@@ -351,7 +450,10 @@ class TrainerV2SinglePhase:
 
         print(f"\n{'='*60}")
         print(f"PHASE 2: ProtoCLR Fine-Tune | {cfg.PROTOCLR_EPOCHS} ep")
-        print(f"         SupCon alpha={cfg.PROTOCLR_ALPHA}, push_weight={cfg.PUSH_WEIGHT}")
+        print(
+            f"         SupCon alpha={cfg.PROTOCLR_ALPHA}, push_weight={cfg.PUSH_WEIGHT}, "
+            f"clf={cfg.PROTOCLR_CLF_LOSS}"
+        )
         print(f"{'='*60}")
 
         # ── Build PrototypeHead model ────────────────────────────────────
@@ -398,7 +500,10 @@ class TrainerV2SinglePhase:
             ],
             weight_decay=cfg.WEIGHT_DECAY,
         )
-        self._setup_loss(classification_loss="ce")  # SupCon + CE in P2a, CE in P2b
+        self._setup_loss(
+            classification_loss=cfg.PROTOCLR_CLF_LOSS,
+            label_smoothing=cfg.PROTOCLR_LABEL_SMOOTHING,
+        )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
             T_max=cfg.PROTOCLR_EPOCHS,
@@ -508,11 +613,19 @@ class TrainerV2SinglePhase:
         print(f"{'='*60}")
         print(f"Malaria ProtoCLR Training | {cfg.BACKBONE}")
         print(f"  Phase 1: {cfg.EPOCHS}ep CE | ProtoCLR: {cfg.USE_PROTOCLR} ({cfg.PROTOCLR_EPOCHS}ep)")
+        print(f"  Init ckpt: {cfg.INIT_FROM_CHECKPOINT if cfg.INIT_FROM_CHECKPOINT else 'None'}")
         print(f"  Classes: {cfg.NUM_CLASSES} | Imbalance: {self.class_counts}")
         print(f"{'='*60}")
 
-        # ── Phase 1: CE baseline ───────────────────────────────────────────
-        proto_init = self._run_phase1()
+        # ── Phase 1: CE baseline OR external checkpoint bootstrap ─────────
+        use_external_init = bool(cfg.INIT_FROM_CHECKPOINT) and cfg.SKIP_PHASE1_IF_INIT
+        if use_external_init and os.path.exists(cfg.INIT_FROM_CHECKPOINT):
+            print("[Run] Skip Phase 1 training, bootstrap from external checkpoint.")
+            proto_init = self._bootstrap_from_checkpoint(cfg.INIT_FROM_CHECKPOINT)
+        else:
+            if use_external_init:
+                print(f"[Run] Init checkpoint not found at {cfg.INIT_FROM_CHECKPOINT}; fallback to full Phase 1.")
+            proto_init = self._run_phase1()
 
         # ── Phase 2: ProtoCLR fine-tune (optional) ──────────────────────────
         if cfg.USE_PROTOCLR and proto_init is not None:
@@ -577,7 +690,7 @@ def load_model_v2(checkpoint_path, device, use_prototype=True):
             "pretrained": False,
             "dropout": cfg_dict.get("DROPOUT", 0.1),
         }
-        temperature = ckpt.get("temperature", 1.0)
+        temperature = sanitize_temperature(ckpt.get("temperature", 1.0))
         state_dict = ckpt["model_state"]
     else:
         model_cfg = {

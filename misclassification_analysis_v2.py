@@ -46,7 +46,7 @@ import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 from PIL import Image
 
-from calibration import TemperatureScaling, compute_ece
+from calibration import TemperatureScaling, compute_ece, sanitize_temperature
 from dataset import CLASS_NAMES, NUM_CLASSES, MalariaDataset, get_transforms
 from model import build_model
 
@@ -71,7 +71,7 @@ def _load_model(checkpoint_path, device):
             "use_dual_head": False,
             "pretrained": False,
         }
-        temperature = ckpt.get("temperature", 1.0)
+        temperature = sanitize_temperature(ckpt.get("temperature", 1.0))
         state_dict = ckpt["model_state"]
     else:
         model_cfg = {
@@ -160,8 +160,9 @@ def _run_full_inference_v2(ts_model, loader, device, dataset, include_proto_dist
             pred_pdist = proto_dists[i, pred_lbl]
             true_pdist = proto_dists[i, int(true_lbl)]
             row["proto_margin"] = pred_pdist - true_pdist
-            sorted_dists = torch.sort(proto_dists[i])[0]
-            row["proto_ratio"] = pred_pdist / (pred_pdist + sorted_dists[1] + 1e-9)
+            sorted_dists = np.sort(proto_dists[i])
+            second_best = sorted_dists[1] if len(sorted_dists) > 1 else sorted_dists[0]
+            row["proto_ratio"] = pred_pdist / (pred_pdist + second_best + 1e-9)
             row["correctness"] = "correct" if int(true_lbl) == pred_lbl else "wrong"
 
             all_rows.append(row)

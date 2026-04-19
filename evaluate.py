@@ -34,7 +34,12 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 
-from calibration import TemperatureScaling, compute_ece, reliability_diagram_data
+from calibration import (
+    TemperatureScaling,
+    compute_ece,
+    reliability_diagram_data,
+    sanitize_temperature,
+)
 from dataset import CLASS_NAMES, NUM_CLASSES, MalariaDataset, get_transforms
 from model import build_model
 
@@ -57,7 +62,7 @@ def load_model(checkpoint_path, device):
             "use_prototype": cfg_dict.get("USE_PROTOTYPE", True),
             "pretrained": False,
         }
-        temperature = ckpt.get("temperature", 1.0)
+        temperature = sanitize_temperature(ckpt.get("temperature", 1.0))
         state_dict = ckpt["model_state"]
     else:
         # bare state dict

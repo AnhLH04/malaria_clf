@@ -12,11 +12,11 @@ V2 additions:
   • reliability_diagram_data: đã có từ v1
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
-import numpy as np
 
 
 # ─────────────────────────────────────────────
@@ -30,7 +30,7 @@ class TemperatureScaling(nn.Module):
 
     def __init__(self, model):
         super().__init__()
-        self.model       = model
+        self.model = model
         self.temperature = nn.Parameter(torch.ones(1) * 1.5)
 
     def forward(self, x):
@@ -38,7 +38,7 @@ class TemperatureScaling(nn.Module):
         return self.scale(logits)
 
     def scale(self, logits):
-        return logits / self.temperature.clamp(min=1e-2)
+        return logits / self.temperature.clamp(min=1e-2, max=10.0)
 
     def fit(self, val_loader, device, lr=0.01, max_iter=100):
         """Optimize temperature on val_loader."""
@@ -64,14 +64,30 @@ class TemperatureScaling(nn.Module):
 
         def closure():
             optimizer.zero_grad()
+            with torch.no_grad():
+                self.temperature.clamp_(min=1e-2, max=10.0)
             scaled = self.scale(all_logits)
             loss = nll_criterion(scaled, all_labels)
             loss.backward()
             return loss
 
         optimizer.step(closure)
+        with torch.no_grad():
+            self.temperature.clamp_(min=1e-2, max=10.0)
         print(f"[TemperatureScaling] Optimal T = {self.temperature.item():.4f}")
-        return self.temperature.item()
+        return float(self.temperature.item())
+
+
+def sanitize_temperature(value, default=1.0, min_temp=1e-2, max_temp=10.0):
+    """Return a safe positive temperature from checkpoint/config value."""
+    try:
+        t = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+    if not np.isfinite(t) or t <= 0:
+        return float(default)
+    return float(np.clip(t, min_temp, max_temp))
 
 
 # ─────────────────────────────────────────────
@@ -144,18 +160,18 @@ class PrototypeConfidenceScorer:
 
         # Softmax-based metrics
         sorted_probs, _ = probs.sort(dim=1, descending=True)
-        max_conf = sorted_probs[:, 0]                                    # (B,)
-        margin_conf = sorted_probs[:, 0] - sorted_probs[:, 1]           # (B,)
+        max_conf = sorted_probs[:, 0]  # (B,)
+        margin_conf = sorted_probs[:, 0] - sorted_probs[:, 1]  # (B,)
 
         # Normalized entropy
         eps = 1e-9
-        entropy = -(probs * torch.log(probs + eps)).sum(dim=1)         # (B,)
+        entropy = -(probs * torch.log(probs + eps)).sum(dim=1)  # (B,)
         n_classes = probs.shape[1]
-        entropy = entropy / np.log(n_classes)                          # normalize to [0,1]
-        norm_entropy = 1 - entropy                                     # high = certain
+        entropy = entropy / np.log(n_classes)  # normalize to [0,1]
+        norm_entropy = 1 - entropy  # high = certain
 
         # Prototype distances
-        if hasattr(self.model.clf_head, 'get_distances'):
+        if hasattr(self.model.clf_head, "get_distances"):
             proto_distances = self.model.clf_head.get_distances(proj_feats)  # (B, C)
         else:
             # FC head fallback: dùng softmax scores reversed
@@ -174,53 +190,57 @@ class PrototypeConfidenceScorer:
         proto_ratio = proto_dist_pred / (proto_dist_pred + proto_dist_second + eps)
 
         results = {
-            "softmax_probs":     probs.cpu().numpy(),
-            "predictions":       predictions.cpu().numpy(),
-            "max_confidence":    max_conf.cpu().numpy(),
+            "softmax_probs": probs.cpu().numpy(),
+            "predictions": predictions.cpu().numpy(),
+            "max_confidence": max_conf.cpu().numpy(),
             "margin_confidence": margin_conf.cpu().numpy(),
-            "proto_distances":   proto_distances.cpu().numpy(),
-            "proto_ratio":       proto_ratio.cpu().numpy(),
-            "entropy":           norm_entropy.cpu().numpy(),
+            "proto_distances": proto_distances.cpu().numpy(),
+            "proto_ratio": proto_ratio.cpu().numpy(),
+            "entropy": norm_entropy.cpu().numpy(),
         }
 
         # Prototype margin (requires true labels)
         if labels is not None:
             labels = labels.to(device)
             proto_dist_true = proto_distances.gather(1, labels.unsqueeze(1)).squeeze(1)  # (B,)
-            proto_margin = proto_dist_pred - proto_dist_true                            # (B,)
+            proto_margin = proto_dist_pred - proto_dist_true  # (B,)
             results["proto_margin"] = proto_margin.cpu().numpy()
             results["correct"] = (predictions == labels).cpu().numpy()
 
         return results
 
     @torch.no_grad()
-    def per_class_analysis(self, images: torch.Tensor, labels: torch.Tensor,
-                           output_dir: str):
+    def per_class_analysis(self, images: torch.Tensor, labels: torch.Tensor, output_dir: str):
         """
         Phân tích confidence metrics cho từng class.
         Xuất CSV và histogram plots.
         """
         import os
-        import pandas as pd
+
         import matplotlib
+        import pandas as pd
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
         os.makedirs(output_dir, exist_ok=True)
 
         scores = self.score(images, labels)
-        df = pd.DataFrame({
-            "true_label": labels.numpy(),
-            "pred_label": scores["predictions"],
-            "max_conf":   scores["max_confidence"],
-            "margin":     scores["margin_confidence"],
-            "proto_margin": scores.get("proto_margin", np.zeros(len(labels))),
-            "proto_ratio":  scores["proto_ratio"],
-            "entropy":      scores["entropy"],
-            "correct":      scores.get("correct", np.zeros(len(labels))),
-        })
+        df = pd.DataFrame(
+            {
+                "true_label": labels.numpy(),
+                "pred_label": scores["predictions"],
+                "max_conf": scores["max_confidence"],
+                "margin": scores["margin_confidence"],
+                "proto_margin": scores.get("proto_margin", np.zeros(len(labels))),
+                "proto_ratio": scores["proto_ratio"],
+                "entropy": scores["entropy"],
+                "correct": scores.get("correct", np.zeros(len(labels))),
+            }
+        )
 
         from dataset import CLASS_NAMES
+
         df["class_name"] = df["true_label"].map(CLASS_NAMES)
 
         # Save CSV
@@ -230,7 +250,7 @@ class PrototypeConfidenceScorer:
         # Histogram per class
         class_names = [CLASS_NAMES[i] for i in sorted(labels.unique().tolist())]
         n = len(class_names)
-        fig, axes = plt.subplots(2, n, figsize=(4*n, 8))
+        fig, axes = plt.subplots(2, n, figsize=(4 * n, 8))
 
         for idx, cls_name in enumerate(class_names):
             mask = df["true_label"] == list(CLASS_NAMES.keys())[list(CLASS_NAMES.values()).index(cls_name)]
@@ -240,21 +260,31 @@ class PrototypeConfidenceScorer:
             ax = axes[0, idx]
             ax.hist(sub["proto_ratio"], bins=20, alpha=0.7, color="steelblue")
             ax.set_title(f"{cls_name}\nproto_ratio", fontsize=10)
-            ax.set_xlabel("Proto Ratio"); ax.set_ylabel("Count")
+            ax.set_xlabel("Proto Ratio")
+            ax.set_ylabel("Count")
             if len(sub) > 0:
-                ax.axvline(sub["proto_ratio"].mean(), color="red", linestyle="--",
-                           label=f"mean={sub['proto_ratio'].mean():.3f}")
+                ax.axvline(
+                    sub["proto_ratio"].mean(),
+                    color="red",
+                    linestyle="--",
+                    label=f"mean={sub['proto_ratio'].mean():.3f}",
+                )
                 ax.legend(fontsize=8)
 
             # Proto margin histogram
             ax = axes[1, idx]
             ax.hist(sub["proto_margin"], bins=20, alpha=0.7, color="orange")
             ax.set_title(f"{cls_name}\nproto_margin", fontsize=10)
-            ax.set_xlabel("Proto Margin (dist_pred - dist_true)"); ax.set_ylabel("Count")
+            ax.set_xlabel("Proto Margin (dist_pred - dist_true)")
+            ax.set_ylabel("Count")
             ax.axvline(0, color="green", linestyle="--", label="margin=0")
             if len(sub) > 0:
-                ax.axvline(sub["proto_margin"].mean(), color="red", linestyle="--",
-                           label=f"mean={sub['proto_margin'].mean():.3f}")
+                ax.axvline(
+                    sub["proto_margin"].mean(),
+                    color="red",
+                    linestyle="--",
+                    label=f"mean={sub['proto_margin'].mean():.3f}",
+                )
                 ax.legend(fontsize=8)
 
         plt.suptitle("Prototype-based Confidence Analysis per Class", fontsize=13)
@@ -274,8 +304,10 @@ class PrototypeConfidenceScorer:
         ]:
             data = df.loc[mask, "proto_ratio"]
             axes[0].hist(data, bins=20, alpha=0.6, color=color, label=f"{group_name} (n={mask.sum()})", density=True)
-        axes[0].set_xlabel("Proto Ratio"); axes[0].set_ylabel("Density")
-        axes[0].set_title("Proto Ratio: Correct vs Incorrect"); axes[0].legend()
+        axes[0].set_xlabel("Proto Ratio")
+        axes[0].set_ylabel("Density")
+        axes[0].set_title("Proto Ratio: Correct vs Incorrect")
+        axes[0].legend()
 
         # Proto margin vs correct
         for group_name, color, mask in [
@@ -284,8 +316,10 @@ class PrototypeConfidenceScorer:
         ]:
             data = df.loc[mask, "proto_margin"]
             axes[1].hist(data, bins=20, alpha=0.6, color=color, label=f"{group_name} (n={mask.sum()})", density=True)
-        axes[1].set_xlabel("Proto Margin (dist_pred - dist_true)"); axes[1].set_ylabel("Density")
-        axes[1].set_title("Proto Margin: Correct vs Incorrect"); axes[1].legend()
+        axes[1].set_xlabel("Proto Margin (dist_pred - dist_true)")
+        axes[1].set_ylabel("Density")
+        axes[1].set_title("Proto Margin: Correct vs Incorrect")
+        axes[1].legend()
         axes[1].axvline(0, color="black", linestyle="--")
 
         fname2 = os.path.join(output_dir, "proto_confidence_calibration.png")
@@ -295,12 +329,18 @@ class PrototypeConfidenceScorer:
 
         # Summary stats
         print("\n[ConfidenceScorer] Summary:")
-        print(f"  Proto Ratio    — correct mean={df[df['correct']]['proto_ratio'].mean():.4f}, "
-              f"incorrect mean={df[~df['correct']]['proto_ratio'].mean():.4f}")
-        print(f"  Proto Margin    — correct mean={df[df['correct']]['proto_margin'].mean():.4f}, "
-              f"incorrect mean={df[~df['correct']]['proto_margin'].mean():.4f}")
-        print(f"  Proto Ratio < 0.6 (uncertain): {(df['proto_ratio'] < 0.6).sum()} samples "
-              f"({(df['proto_ratio'] < 0.6).mean()*100:.1f}%)")
+        print(
+            f"  Proto Ratio    — correct mean={df[df['correct']]['proto_ratio'].mean():.4f}, "
+            f"incorrect mean={df[~df['correct']]['proto_ratio'].mean():.4f}"
+        )
+        print(
+            f"  Proto Margin    — correct mean={df[df['correct']]['proto_margin'].mean():.4f}, "
+            f"incorrect mean={df[~df['correct']]['proto_margin'].mean():.4f}"
+        )
+        print(
+            f"  Proto Ratio < 0.6 (uncertain): {(df['proto_ratio'] < 0.6).sum()} samples "
+            f"({(df['proto_ratio'] < 0.6).mean()*100:.1f}%)"
+        )
         print(f"  Proto Margin > 0 (dist_pred > dist_true): {(df['proto_margin'] > 0).sum()} samples")
 
         return df
@@ -318,16 +358,16 @@ def compute_ece(probs, labels, n_bins=15):
     """
     confidences = probs.max(axis=1)
     predictions = probs.argmax(axis=1)
-    correct     = (predictions == labels).astype(float)
+    correct = (predictions == labels).astype(float)
 
     bins = np.linspace(0, 1, n_bins + 1)
-    ece  = 0.0
+    ece = 0.0
     for i in range(n_bins):
         lo, hi = bins[i], bins[i + 1]
         mask = (confidences >= lo) & (confidences < hi)
         if mask.sum() == 0:
             continue
-        acc  = correct[mask].mean()
+        acc = correct[mask].mean()
         conf = confidences[mask].mean()
         ece += mask.sum() / len(labels) * abs(acc - conf)
 
@@ -338,15 +378,15 @@ def reliability_diagram_data(probs, labels, n_bins=15):
     """Returns (bin_midpoints, accuracies, confidences, counts) for plotting."""
     confidences = probs.max(axis=1)
     predictions = probs.argmax(axis=1)
-    correct     = (predictions == labels).astype(float)
+    correct = (predictions == labels).astype(float)
 
-    bins      = np.linspace(0, 1, n_bins + 1)
+    bins = np.linspace(0, 1, n_bins + 1)
     midpoints = (bins[:-1] + bins[1:]) / 2
     accs, confs, counts = [], [], []
 
     for i in range(n_bins):
         lo, hi = bins[i], bins[i + 1]
-        mask   = (confidences >= lo) & (confidences < hi)
+        mask = (confidences >= lo) & (confidences < hi)
         counts.append(mask.sum())
         if mask.sum() == 0:
             accs.append(0.0)
