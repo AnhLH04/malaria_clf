@@ -40,11 +40,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from calibration import TemperatureScaling
 from dataset import MalariaDataset, get_transforms
-from losses import (
-    DynamicFocalLoss,
-    PrototypePushLoss,
-    SupConLoss,
-)
+from losses import DynamicFocalLoss, PrototypePushLoss, SupConLoss
 from model import MalariaProtoCLFv2, build_model, compute_class_prototypes
 
 warnings.filterwarnings("ignore")
@@ -58,51 +54,51 @@ class TrainConfigV2:
     BASE_DIR = "/kaggle/input/datasets/khanhtq2101/malaria-parasite/final_malaria_full_class_classification_cropped/5 classes - May 2025"
     IMG_BASE = "/kaggle/input/datasets/khanhtq2101/malaria-parasite/final_malaria_full_class_classification_cropped"
     TRAIN_ANN = os.path.join(BASE_DIR, "train_annotation_5classes.txt")
-    VAL_ANN   = os.path.join(BASE_DIR, "val_annotation_5classes.txt")
-    TEST_ANN  = os.path.join(BASE_DIR, "test_annotation_5classes.txt")
+    VAL_ANN = os.path.join(BASE_DIR, "val_annotation_5classes.txt")
+    TEST_ANN = os.path.join(BASE_DIR, "test_annotation_5classes.txt")
     OUTPUT_DIR = "/kaggle/working/malaria_proto_v2"
 
     # ── Model ─────────────────────────────────────────────────────────────
-    BACKBONE    = "convnext_tiny.in22k_ft_in1k"
+    BACKBONE = "convnext_tiny.in22k_ft_in1k"
     NUM_CLASSES = 5
-    PROJ_DIM    = 128
-    IMG_SIZE    = 224
-    DROPOUT     = 0.1
+    PROJ_DIM = 128
+    IMG_SIZE = 224
+    DROPOUT = 0.1
 
     # ── Training ───────────────────────────────────────────────────────────
-    EPOCHS            = 30
-    BATCH_SIZE        = 32
-    LR                = 3e-4
-    WEIGHT_DECAY      = 1e-4
-    WARMUP_EPOCHS     = 3
-    LABEL_SMOOTHING   = 0.1  # mild label smoothing
+    EPOCHS = 30
+    BATCH_SIZE = 32
+    LR = 3e-4
+    WEIGHT_DECAY = 1e-4
+    WARMUP_EPOCHS = 3
+    LABEL_SMOOTHING = 0.1  # mild label smoothing
 
     # ── ProtoCLR Fine-Tune (Phase 2) ───────────────────────────────────────
-    USE_PROTOCLR      = True  # run ProtoCLR fine-tune after Phase 1
-    PROTOCLR_EPOCHS   = 15
-    PROTOCLR_LR_HEAD  = 5e-4
-    PROTOCLR_LR_BACK  = 3e-6   # backbone nearly frozen
-    PROTOCLR_ALPHA    = 0.3    # SupCon weight (30% SupCon, 70% CE)
-    PUSH_WEIGHT       = 0.1    # prototype push-away loss weight
+    USE_PROTOCLR = True  # run ProtoCLR fine-tune after Phase 1
+    PROTOCLR_EPOCHS = 15
+    PROTOCLR_LR_HEAD = 5e-4
+    PROTOCLR_LR_BACK = 1e-5  # slightly higher to allow backbone fine-tuning
+    PROTOCLR_ALPHA = 0.5  # SupCon weight (50% SupCon, 50% CE) - increased from 0.3
+    PUSH_WEIGHT = 0.2  # prototype push-away loss weight (increased from 0.1)
 
     # ── Loss ───────────────────────────────────────────────────────────────
-    SUPCON_TEMP    = 0.07
-    CLF_LOSS       = "focal"   # "focal" | "ce" | "asymmetric_ce"
-    MAJORITY_CLASS = 4         # Unparasitized
+    SUPCON_TEMP = 0.07
+    CLF_LOSS = "focal"  # "focal" | "ce" | "asymmetric_ce"
+    MAJORITY_CLASS = 4  # Unparasitized
 
     # ── Early stopping ────────────────────────────────────────────────────
-    EARLY_STOP_PATIENCE  = 8
+    EARLY_STOP_PATIENCE = 8
     EARLY_STOP_MIN_DELTA = 0.002
-    EARLY_STOP_SMOOTH    = 5
+    EARLY_STOP_SMOOTH = 5
 
     # ── Calibration ───────────────────────────────────────────────────────
     DO_CALIBRATION = True
 
     # ── Misc ──────────────────────────────────────────────────────────────
-    SEED       = 42
+    SEED = 42
     NUM_WORKERS = 4
-    PIN_MEMORY  = True
-    DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
+    PIN_MEMORY = True
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,22 +146,27 @@ class TrainerV2SinglePhase:
         self.class_counts = self._build_class_counts()
         self._setup_loss()
 
-        self.scaler    = GradScaler()
+        self.scaler = GradScaler()
         self.best_metric = 0.0
-        self.best_state  = None
-        self.history     = {
-            "phase": [], "epoch": [], "train_loss": [],
-            "val_loss": [], "val_macro_f1": [], "alpha": [], "phase_desc": [],
+        self.best_state = None
+        self.history = {
+            "phase": [],
+            "epoch": [],
+            "train_loss": [],
+            "val_loss": [],
+            "val_macro_f1": [],
+            "alpha": [],
+            "phase_desc": [],
         }
 
     # ── Data ───────────────────────────────────────────────────────────────
     def _setup_data(self):
         cfg = self.cfg
         train_tf = get_transforms("train", cfg.IMG_SIZE)
-        val_tf   = get_transforms("val",   cfg.IMG_SIZE)
+        val_tf = get_transforms("val", cfg.IMG_SIZE)
 
         self.train_ds = MalariaDataset(cfg.TRAIN_ANN, cfg.IMG_BASE, transform=train_tf)
-        self.val_ds   = MalariaDataset(cfg.VAL_ANN,   cfg.IMG_BASE, transform=val_tf)
+        self.val_ds = MalariaDataset(cfg.VAL_ANN, cfg.IMG_BASE, transform=val_tf)
 
         sampler = make_weighted_sampler(self.train_ds)
         self.train_loader = DataLoader(
@@ -203,14 +204,16 @@ class TrainerV2SinglePhase:
             ).to(self.device)
         elif classification_loss == "asymmetric_ce":
             from losses import AsymmetricLabelSmoothingCE
+
             self.clf_loss = AsymmetricLabelSmoothingCE(
-                cfg.NUM_CLASSES, majority_class=cfg.MAJORITY_CLASS,
+                cfg.NUM_CLASSES,
+                majority_class=cfg.MAJORITY_CLASS,
             ).to(self.device)
         else:
             self.clf_loss = nn.CrossEntropyLoss().to(self.device)
 
         self.supcon_loss = SupConLoss(temperature=cfg.SUPCON_TEMP).to(self.device)
-        self.push_loss   = PrototypePushLoss(weight=cfg.PUSH_WEIGHT).to(self.device)
+        self.push_loss = PrototypePushLoss(weight=cfg.PUSH_WEIGHT).to(self.device)
 
     # ── Phase 1: CE/Focal training ─────────────────────────────────────────
     def _run_phase1(self):
@@ -228,7 +231,7 @@ class TrainerV2SinglePhase:
             backbone_name=cfg.BACKBONE,
             num_classes=cfg.NUM_CLASSES,
             proj_dim=cfg.PROJ_DIM,
-            use_prototype=False,   # FC head throughout Phase 1
+            use_prototype=False,  # FC head throughout Phase 1
             use_dual_head=False,
             pretrained=True,
             proto_init=None,
@@ -258,7 +261,7 @@ class TrainerV2SinglePhase:
 
             if macro_f1 > self.best_metric:
                 self.best_metric = macro_f1
-                self.best_state  = copy.deepcopy(self.model.state_dict())
+                self.best_state = copy.deepcopy(self.model.state_dict())
                 torch.save(self.best_state, os.path.join(cfg.OUTPUT_DIR, "phase1_best.pth"))
 
         p1_f1 = self.best_metric
@@ -269,7 +272,9 @@ class TrainerV2SinglePhase:
             print("\n[Phase 1] Computing class prototypes for ProtoCLR...")
             self.model.load_state_dict(self.best_state)  # ensure model is in best state
             proto_init = compute_class_prototypes(
-                self.model, self.train_loader, self.device,
+                self.model,
+                self.train_loader,
+                self.device,
                 max_samples_per_class=2000,
             )
             print(f"[Phase 1] Prototypes shape={proto_init.shape}, norms={proto_init.norm(dim=1).tolist()}")
@@ -279,17 +284,25 @@ class TrainerV2SinglePhase:
     def _setup_scheduler(self, total_epochs, warmup_epochs):
         if warmup_epochs > 0:
             warmup = torch.optim.lr_scheduler.LinearLR(
-                self.optimizer, start_factor=0.1, total_iters=warmup_epochs,
+                self.optimizer,
+                start_factor=0.1,
+                total_iters=warmup_epochs,
             )
             cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=total_epochs - warmup_epochs, eta_min=1e-6,
+                self.optimizer,
+                T_max=total_epochs - warmup_epochs,
+                eta_min=1e-6,
             )
             self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-                self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+                self.optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[warmup_epochs],
             )
         else:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=total_epochs, eta_min=1e-6,
+                self.optimizer,
+                T_max=total_epochs,
+                eta_min=1e-6,
             )
 
     def _train_epoch_phase1(self, epoch):
@@ -313,6 +326,7 @@ class TrainerV2SinglePhase:
     @torch.no_grad()
     def _val_epoch_phase1(self):
         from sklearn.metrics import f1_score
+
         self.model.eval()
         total_loss, all_preds, all_labels = 0.0, [], []
         for imgs, labels in self.val_loader:
@@ -345,10 +359,10 @@ class TrainerV2SinglePhase:
             backbone_name=cfg.BACKBONE,
             num_classes=cfg.NUM_CLASSES,
             proj_dim=cfg.PROJ_DIM,
-            use_prototype=True,      # PrototypeHead
+            use_prototype=True,  # PrototypeHead
             use_dual_head=False,
-            pretrained=False,        # weights loaded below
-            proto_init=proto_init,   # class-mean from Phase 1
+            pretrained=False,  # weights loaded below
+            proto_init=proto_init,  # class-mean from Phase 1
             dropout=cfg.DROPOUT,
         ).to(self.device)
 
@@ -366,19 +380,26 @@ class TrainerV2SinglePhase:
         proto_model.load_state_dict(proto_state, strict=False)
         print(f"[Phase 2] Loaded {len(loaded_keys)} keys from Phase 1, skipped {len(skipped_keys)} (FC head)")
 
-        # ── Freeze backbone; train prototype + proj_head ───────────────
-        for param in proto_model.backbone.parameters():
-            param.requires_grad = False
-
+        # ── Fine-tune backbone (with low LR) + prototype + proj_head ───────────────
+        # Set different LRs: backbone vs head+prototypes
         self.model = proto_model
+
+        # Separate parameter groups for differential learning rates
+        backbone_params = [p for p in self.model.backbone.parameters() if p.requires_grad]
+        other_params = [p for p in self.model.parameters() if p not in backbone_params and p.requires_grad]
+
         self.optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=cfg.PROTOCLR_LR_HEAD,
+            [
+                {"params": backbone_params, "lr": cfg.PROTOCLR_LR_BACK},
+                {"params": other_params, "lr": cfg.PROTOCLR_LR_HEAD},
+            ],
             weight_decay=cfg.WEIGHT_DECAY,
         )
-        self._setup_loss(classification_loss="ce")   # SupCon + CE in P2a, CE in P2b
+        self._setup_loss(classification_loss="ce")  # SupCon + CE in P2a, CE in P2b
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=cfg.PROTOCLR_EPOCHS, eta_min=1e-6,
+            self.optimizer,
+            T_max=cfg.PROTOCLR_EPOCHS,
+            eta_min=1e-6,
         )
 
         p2_epochs = cfg.PROTOCLR_EPOCHS
@@ -391,7 +412,12 @@ class TrainerV2SinglePhase:
                 self.scheduler.step()
 
             self._log_epoch(
-                "P2", epoch, p2_epochs, t_loss, v_loss, macro_f1,
+                "P2",
+                epoch,
+                p2_epochs,
+                t_loss,
+                v_loss,
+                macro_f1,
                 alpha=cfg.PROTOCLR_ALPHA,
                 extra=f"SC:{t_sc:.4f} push:{t_push:.4f}",
             )
@@ -399,7 +425,7 @@ class TrainerV2SinglePhase:
             # [BUGFIX-1] Reset es counter AFTER saving best_state, not inside the if-block
             if macro_f1 > self.best_metric:
                 self.best_metric = macro_f1
-                self.best_state  = copy.deepcopy(self.model.state_dict())
+                self.best_state = copy.deepcopy(self.model.state_dict())
                 torch.save(self.best_state, os.path.join(cfg.OUTPUT_DIR, "best_protoclr.pth"))
 
         p2_f1 = self.best_metric
@@ -420,10 +446,10 @@ class TrainerV2SinglePhase:
             with autocast():
                 proj_feats, logits = self.model(imgs)
 
-                l_sc   = self.supcon_loss(proj_feats, labels)
-                l_clf  = self.clf_loss(logits, labels)
+                l_sc = self.supcon_loss(proj_feats, labels)
+                l_clf = self.clf_loss(logits, labels)
                 l_push = self.push_loss(self.model.clf_head.prototypes)
-                loss   = alpha * l_sc + (1.0 - alpha) * l_clf + l_push
+                loss = alpha * l_sc + (1.0 - alpha) * l_clf + l_push
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -431,8 +457,8 @@ class TrainerV2SinglePhase:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_loss  += loss.item()
-            total_sc   += l_sc.item()
+            total_loss += loss.item()
+            total_sc += l_sc.item()
             total_push += l_push.item()
             n += 1
 
@@ -441,6 +467,7 @@ class TrainerV2SinglePhase:
     @torch.no_grad()
     def _val_epoch_protoclr(self):
         from sklearn.metrics import f1_score
+
         self.model.eval()
         total_loss, all_preds, all_labels = 0.0, [], []
         for imgs, labels in self.val_loader:
@@ -537,20 +564,20 @@ def load_model_v2(checkpoint_path, device, use_prototype=True):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     if "cfg" in ckpt:
-        cfg_dict  = ckpt["cfg"]
+        cfg_dict = ckpt["cfg"]
         model_cfg = {
-            "backbone":      cfg_dict.get("BACKBONE", "convnext_tiny.in22k_ft_in1k"),
-            "num_classes":   cfg_dict.get("NUM_CLASSES", 5),
-            "proj_dim":      cfg_dict.get("PROJ_DIM", 128),
-            "use_prototype": use_prototype,   # override to user's choice
+            "backbone": cfg_dict.get("BACKBONE", "convnext_tiny.in22k_ft_in1k"),
+            "num_classes": cfg_dict.get("NUM_CLASSES", 5),
+            "proj_dim": cfg_dict.get("PROJ_DIM", 128),
+            "use_prototype": use_prototype,  # override to user's choice
             "use_dual_head": cfg_dict.get("USE_DUAL_HEAD", False),
-            "pretrained":    False,
-            "dropout":       cfg_dict.get("DROPOUT", 0.1),
+            "pretrained": False,
+            "dropout": cfg_dict.get("DROPOUT", 0.1),
         }
         temperature = ckpt.get("temperature", 1.0)
-        state_dict  = ckpt["model_state"]
+        state_dict = ckpt["model_state"]
     else:
-        model_cfg  = {
+        model_cfg = {
             "backbone": "convnext_tiny.in22k_ft_in1k",
             "num_classes": 5,
             "proj_dim": 128,
@@ -558,7 +585,7 @@ def load_model_v2(checkpoint_path, device, use_prototype=True):
             "pretrained": False,
         }
         temperature = 1.0
-        state_dict  = ckpt
+        state_dict = ckpt
 
     model = build_model(model_cfg)
     # [BUGFIX-4] strict=False prevents RuntimeError when checkpoint has

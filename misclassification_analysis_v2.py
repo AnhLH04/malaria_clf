@@ -29,10 +29,11 @@ Usage:
     scores = analyzer.score(test_images, test_labels)
 """
 
-import os
-import json
 import copy
+import json
+import os
 
+import matplotlib
 import numpy as np
 import pandas as pd
 import torch
@@ -40,20 +41,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
 from PIL import Image
 
 from calibration import TemperatureScaling, compute_ece
 from dataset import CLASS_NAMES, NUM_CLASSES, MalariaDataset, get_transforms
 from model import build_model
 
-
-CLASS_LIST   = [CLASS_NAMES[i] for i in range(NUM_CLASSES)]
+CLASS_LIST = [CLASS_NAMES[i] for i in range(NUM_CLASSES)]
 PARASITE_IDX = [0, 1, 2, 3]
-COLORS_BAR   = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#95a5a6"]
+COLORS_BAR = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#95a5a6"]
 PROTO_COLORS = ["#c0392b", "#2980b9", "#27ae60", "#e67e22", "#7f8c8d"]  # đậm hơn cho proto
 
 
@@ -63,23 +62,27 @@ PROTO_COLORS = ["#c0392b", "#2980b9", "#27ae60", "#e67e22", "#7f8c8d"]  # đậm
 def _load_model(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device)
     if "cfg" in ckpt:
-        cfg_dict  = ckpt["cfg"]
+        cfg_dict = ckpt["cfg"]
         model_cfg = {
-            "backbone":      cfg_dict.get("BACKBONE", "convnext_tiny.in22k_ft_in1k"),
-            "num_classes":   cfg_dict.get("NUM_CLASSES", 5),
-            "proj_dim":      cfg_dict.get("PROJ_DIM", 128),
+            "backbone": cfg_dict.get("BACKBONE", "convnext_tiny.in22k_ft_in1k"),
+            "num_classes": cfg_dict.get("NUM_CLASSES", 5),
+            "proj_dim": cfg_dict.get("PROJ_DIM", 128),
             "use_prototype": cfg_dict.get("USE_PROTOTYPE", True),
             "use_dual_head": False,
-            "pretrained":    False,
+            "pretrained": False,
         }
         temperature = ckpt.get("temperature", 1.0)
-        state_dict  = ckpt["model_state"]
+        state_dict = ckpt["model_state"]
     else:
-        model_cfg   = {"backbone": "convnext_tiny.in22k_ft_in1k",
-                       "num_classes": 5, "proj_dim": 128,
-                       "use_prototype": True, "pretrained": False}
+        model_cfg = {
+            "backbone": "convnext_tiny.in22k_ft_in1k",
+            "num_classes": 5,
+            "proj_dim": 128,
+            "use_prototype": True,
+            "pretrained": False,
+        }
         temperature = 1.0
-        state_dict  = ckpt
+        state_dict = ckpt
 
     model = build_model(model_cfg)
     model.load_state_dict(state_dict)
@@ -96,7 +99,7 @@ def _get_proto_distances(model, images, device):
     images = images.to(device)
     with torch.no_grad():
         proj_feats, logits = model(images)
-        if hasattr(model.clf_head, 'get_distances'):
+        if hasattr(model.clf_head, "get_distances"):
             return model.clf_head.get_distances(proj_feats).cpu()
         # FC fallback
         probs = F.softmax(logits, dim=-1)
@@ -112,20 +115,20 @@ def _run_full_inference_v2(ts_model, loader, device, dataset, include_proto_dist
     all_rows = []
 
     for batch_idx, (imgs, labels) in enumerate(loader):
-        imgs   = imgs.to(device)
+        imgs = imgs.to(device)
         labels_np = labels.numpy()
         _, logits = ts_model.model(imgs)  # bypass TemperatureScaling, get raw logits
         probs = F.softmax(logits, dim=1).cpu().numpy()
 
         # Prototype distances
-        if include_proto_dist and hasattr(ts_model.model.clf_head, 'get_distances'):
+        if include_proto_dist and hasattr(ts_model.model.clf_head, "get_distances"):
             proj_feats, _ = ts_model.model.get_embeddings(imgs)
             proto_dists = ts_model.model.clf_head.get_distances(proj_feats).cpu().numpy()
         else:
             proto_dists = 1 - probs  # fallback
 
         start = batch_idx * loader.batch_size
-        end   = start + len(labels)
+        end = start + len(labels)
         paths = [dataset.samples[i][0] for i in range(start, min(end, len(dataset)))]
 
         for i, (path, true_lbl) in enumerate(zip(paths, labels_np)):
@@ -135,13 +138,13 @@ def _run_full_inference_v2(ts_model, loader, device, dataset, include_proto_dist
             margin_conf = float(sorted_probs[0] - sorted_probs[1])
 
             row = {
-                "path":         path,
-                "true_idx":    int(true_lbl),
-                "true_label":  CLASS_NAMES[int(true_lbl)],
-                "pred_idx":    pred_lbl,
-                "pred_label":  CLASS_NAMES[pred_lbl],
-                "correct":     int(true_lbl) == pred_lbl,
-                "max_conf":    max_conf,
+                "path": path,
+                "true_idx": int(true_lbl),
+                "true_label": CLASS_NAMES[int(true_lbl)],
+                "pred_idx": pred_lbl,
+                "pred_label": CLASS_NAMES[pred_lbl],
+                "correct": int(true_lbl) == pred_lbl,
+                "max_conf": max_conf,
                 "margin_conf": margin_conf,
             }
 
@@ -155,10 +158,11 @@ def _run_full_inference_v2(ts_model, loader, device, dataset, include_proto_dist
 
             # Key proto metrics
             pred_pdist = proto_dists[i, pred_lbl]
-            true_pdist  = proto_dists[i, int(true_lbl)]
-            row["proto_margin"]  = pred_pdist - true_pdist
-            row["proto_ratio"]   = pred_pdist / (pred_pdist + proto_dists[i].sort()[0][1] + 1e-9)
-            row["correctness"]    = "correct" if int(true_lbl) == pred_lbl else "wrong"
+            true_pdist = proto_dists[i, int(true_lbl)]
+            row["proto_margin"] = pred_pdist - true_pdist
+            sorted_dists = torch.sort(proto_dists[i])[0]
+            row["proto_ratio"] = pred_pdist / (pred_pdist + sorted_dists[1] + 1e-9)
+            row["correctness"] = "correct" if int(true_lbl) == pred_lbl else "wrong"
 
             all_rows.append(row)
 
@@ -170,28 +174,28 @@ def _run_full_inference_v2(ts_model, loader, device, dataset, include_proto_dist
 # ─────────────────────────────────────────────
 def _confusion_pair_stats_v2(df_wrong, output_dir):
     """Phân tích chi tiết mỗi confusion pair với prototype distances."""
-    score_cols   = [f"prob_{CLASS_NAMES[i]}"  for i in range(NUM_CLASSES)]
-    pdist_cols   = [f"pdist_{CLASS_NAMES[i]}"  for i in range(NUM_CLASSES)]
+    score_cols = [f"prob_{CLASS_NAMES[i]}" for i in range(NUM_CLASSES)]
+    pdist_cols = [f"pdist_{CLASS_NAMES[i]}" for i in range(NUM_CLASSES)]
 
-    print("\n" + "="*75)
+    print("\n" + "=" * 75)
     print("MISCLASSIFICATION ANALYSIS V2 — Per Confusion Pair + Prototype Distances")
-    print("="*75)
+    print("=" * 75)
 
     pairs = df_wrong.groupby(["true_label", "pred_label"])
     pair_rows = []
 
     for (true_lbl, pred_lbl), group in pairs:
         n = len(group)
-        avg_probs  = {col: group[col].mean() for col in score_cols}
+        avg_probs = {col: group[col].mean() for col in score_cols}
         avg_pdists = {col: group[col].mean() for col in pdist_cols}
         avg_proto_margin = group["proto_margin"].mean()
-        avg_proto_ratio  = group["proto_ratio"].mean()
+        avg_proto_ratio = group["proto_ratio"].mean()
 
         row = {
-            "true→pred":   f"{true_lbl}→{pred_lbl}",
-            "count":        n,
+            "true→pred": f"{true_lbl}→{pred_lbl}",
+            "count": n,
             "avg_proto_margin": avg_proto_margin,
-            "avg_proto_ratio":  avg_proto_ratio,
+            "avg_proto_ratio": avg_proto_ratio,
         }
         row.update({col.replace("prob_", "avg_prob_"): f"{v:.4f}" for col, v in avg_probs.items()})
         row.update({col.replace("pdist_", "avg_pdist_"): f"{v:.4f}" for col, v in avg_pdists.items()})
@@ -235,7 +239,7 @@ def _generate_gradcam_overlay(model, image_tensor, class_idx, device):
 
     # Forward
     feats = model.backbone(inp)
-    proj  = model.proj_head(feats)
+    proj = model.proj_head(feats)
     logits = model.clf_head(proj)
 
     # Backward với target class
@@ -244,7 +248,7 @@ def _generate_gradcam_overlay(model, image_tensor, class_idx, device):
     one_hot[0, class_idx] = 1.0
     logits.backward(gradient=one_hot)
 
-    gradients = inp.grad   # chưa được global pooled → không đúng
+    gradients = inp.grad  # chưa được global pooled → không đúng
     # Thực ra: gradient của target layer (backbone output)
     # ConvNeXt forward output = features sau global pool
     # Thay vì hook phức tạp, dùng gradient approximation
@@ -265,8 +269,7 @@ def _generate_gradcam_overlay(model, image_tensor, class_idx, device):
 # ─────────────────────────────────────────────
 # Visualize misclassified samples (v2: thêm proto metrics)
 # ─────────────────────────────────────────────
-def _visualize_misclassified_v2(df_wrong, output_dir, max_per_pair=6, img_size=96,
-                                 show_proto_dist=True):
+def _visualize_misclassified_v2(df_wrong, output_dir, max_per_pair=6, img_size=96, show_proto_dist=True):
     """
     Grid visualization với:
       • Ảnh cell
@@ -274,14 +277,11 @@ def _visualize_misclassified_v2(df_wrong, output_dir, max_per_pair=6, img_size=9
       • Bar chart: prototype distances (5 class)
       • Proto margin + ratio annotations
     """
-    prob_cols  = [f"prob_{CLASS_NAMES[i]}"  for i in range(NUM_CLASSES)]
+    prob_cols = [f"prob_{CLASS_NAMES[i]}" for i in range(NUM_CLASSES)]
     pdist_cols = [f"pdist_{CLASS_NAMES[i]}" for i in range(NUM_CLASSES)]
 
     pairs = list(df_wrong.groupby(["true_label", "pred_label"]))
-    parasite_pairs = [
-        (key, grp) for key, grp in pairs
-        if key[0] != "Unparasitized" or key[1] != "Unparasitized"
-    ]
+    parasite_pairs = [(key, grp) for key, grp in pairs if key[0] != "Unparasitized" or key[1] != "Unparasitized"]
 
     for (true_lbl, pred_lbl), group in parasite_pairs:
         samples = group.head(max_per_pair)
@@ -293,7 +293,9 @@ def _visualize_misclassified_v2(df_wrong, output_dir, max_per_pair=6, img_size=9
         fig = plt.figure(figsize=(5 * n, 2.5 * n_rows))
         fig.suptitle(
             f"Misclassified: {true_lbl}→{pred_lbl}  (n={len(group)} total)",
-            fontsize=13, fontweight="bold", y=1.01,
+            fontsize=13,
+            fontweight="bold",
+            y=1.01,
         )
         gs = gridspec.GridSpec(n_rows, n, figure=fig, hspace=0.4, wspace=0.3)
 
@@ -316,35 +318,51 @@ def _visualize_misclassified_v2(df_wrong, output_dir, max_per_pair=6, img_size=9
             # Row 1: Probability bar
             ax_prob = fig.add_subplot(gs[1, col_idx])
             probs = [row[col] for col in prob_cols]
-            bars  = ax_prob.bar(CLASS_LIST, probs, color=COLORS_BAR, width=0.6)
+            bars = ax_prob.bar(CLASS_LIST, probs, color=COLORS_BAR, width=0.6)
             ax_prob.set_ylim(0, 1.05)
             ax_prob.set_ylabel("Prob", fontsize=7)
             ax_prob.tick_params(axis="x", labelsize=7)
             ax_prob.tick_params(axis="y", labelsize=6)
             for bar, score in zip(bars, probs):
                 if score > 0.05:
-                    ax_prob.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                                 f"{score:.3f}", ha="center", va="bottom", fontsize=6)
-            true_idx  = CLASS_LIST.index(true_lbl)
-            pred_idx  = CLASS_LIST.index(pred_lbl)
-            bars[true_idx].set_edgecolor("green");  bars[true_idx].set_linewidth(2.5)
-            bars[pred_idx].set_edgecolor("red");    bars[pred_idx].set_linewidth(2.5)
+                    ax_prob.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.01,
+                        f"{score:.3f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=6,
+                    )
+            true_idx = CLASS_LIST.index(true_lbl)
+            pred_idx = CLASS_LIST.index(pred_lbl)
+            bars[true_idx].set_edgecolor("green")
+            bars[true_idx].set_linewidth(2.5)
+            bars[pred_idx].set_edgecolor("red")
+            bars[pred_idx].set_linewidth(2.5)
 
             if show_proto_dist:
                 # Row 2: Prototype distance bar
                 ax_pdist = fig.add_subplot(gs[2, col_idx])
                 pdists = [row[col] for col in pdist_cols]
-                bars2   = ax_pdist.bar(CLASS_LIST, pdists, color=PROTO_COLORS, width=0.6)
+                bars2 = ax_pdist.bar(CLASS_LIST, pdists, color=PROTO_COLORS, width=0.6)
                 ax_pdist.set_ylim(0, 2.5)
                 ax_pdist.set_ylabel("Cos Dist", fontsize=7)
                 ax_pdist.tick_params(axis="x", labelsize=7)
                 ax_pdist.tick_params(axis="y", labelsize=6)
                 for bar, score in zip(bars2, pdists):
                     if score > 0.05:
-                        ax_pdist.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                                      f"{score:.3f}", ha="center", va="bottom", fontsize=6)
-                bars2[true_idx].set_edgecolor("green");  bars2[true_idx].set_linewidth(2.5)
-                bars2[pred_idx].set_edgecolor("red");    bars2[pred_idx].set_linewidth(2.5)
+                        ax_pdist.text(
+                            bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + 0.02,
+                            f"{score:.3f}",
+                            ha="center",
+                            va="bottom",
+                            fontsize=6,
+                        )
+                bars2[true_idx].set_edgecolor("green")
+                bars2[true_idx].set_linewidth(2.5)
+                bars2[pred_idx].set_edgecolor("red")
+                bars2[pred_idx].set_linewidth(2.5)
 
         plt.tight_layout()
         fname = f"misclassified_v2_{true_lbl}_to_{pred_lbl}.png"
@@ -363,8 +381,8 @@ def _plot_proto_confidence_overview(df, output_dir):
     # 1. Proto margin distribution: correct vs incorrect
     ax = axes[0, 0]
     for label, color, mask in [
-        ("Correct",   "green", df["correct"]),
-        ("Incorrect", "red",   ~df["correct"]),
+        ("Correct", "green", df["correct"]),
+        ("Incorrect", "red", ~df["correct"]),
     ]:
         data = df.loc[mask, "proto_margin"]
         ax.hist(data, bins=25, alpha=0.6, color=color, label=f"{label} (n={mask.sum()})", density=True)
@@ -377,8 +395,8 @@ def _plot_proto_confidence_overview(df, output_dir):
     # 2. Proto ratio: correct vs incorrect
     ax = axes[0, 1]
     for label, color, mask in [
-        ("Correct",   "green", df["correct"]),
-        ("Incorrect", "red",   ~df["correct"]),
+        ("Correct", "green", df["correct"]),
+        ("Incorrect", "red", ~df["correct"]),
     ]:
         data = df.loc[mask, "proto_ratio"]
         ax.hist(data, bins=25, alpha=0.6, color=color, label=f"{label} (n={mask.sum()})", density=True)
@@ -391,10 +409,22 @@ def _plot_proto_confidence_overview(df, output_dir):
     # 3. Margin confidence vs proto margin scatter
     ax = axes[0, 2]
     correct_mask = df["correct"]
-    ax.scatter(df.loc[correct_mask, "max_conf"], df.loc[correct_mask, "proto_margin"],
-               alpha=0.5, color="green", s=10, label=f"Correct (n={correct_mask.sum()})")
-    ax.scatter(df.loc[~correct_mask, "max_conf"], df.loc[~correct_mask, "proto_margin"],
-               alpha=0.5, color="red", s=15, label=f"Wrong (n={(~correct_mask).sum()})")
+    ax.scatter(
+        df.loc[correct_mask, "max_conf"],
+        df.loc[correct_mask, "proto_margin"],
+        alpha=0.5,
+        color="green",
+        s=10,
+        label=f"Correct (n={correct_mask.sum()})",
+    )
+    ax.scatter(
+        df.loc[~correct_mask, "max_conf"],
+        df.loc[~correct_mask, "proto_margin"],
+        alpha=0.5,
+        color="red",
+        s=15,
+        label=f"Wrong (n={(~correct_mask).sum()})",
+    )
     ax.set_xlabel("Max Confidence (softmax)")
     ax.set_ylabel("Proto Margin")
     ax.set_title("Confidence vs Proto Margin\n(red dots = misclassified)")
@@ -412,7 +442,7 @@ def _plot_proto_confidence_overview(df, output_dir):
             class_data.append(df.loc[mask, "proto_ratio"].values)
             class_labels.append(CLASS_NAMES[cls_idx])
     bp = ax.boxplot(class_data, labels=class_labels, patch_artist=True)
-    for patch, color in zip(bp["boxes"], COLORS_BAR[:len(class_data)]):
+    for patch, color in zip(bp["boxes"], COLORS_BAR[: len(class_data)]):
         patch.set_facecolor(color)
         patch.set_alpha(0.6)
     ax.set_ylabel("Proto Ratio")
@@ -427,7 +457,7 @@ def _plot_proto_confidence_overview(df, output_dir):
         if mask.sum() > 0:
             class_data2.append(df.loc[mask, "proto_margin"].values)
     bp2 = ax.boxplot(class_data2, labels=class_labels, patch_artist=True)
-    for patch, color in zip(bp2["boxes"], COLORS_BAR[:len(class_data2)]):
+    for patch, color in zip(bp2["boxes"], COLORS_BAR[: len(class_data2)]):
         patch.set_facecolor(color)
         patch.set_alpha(0.6)
     ax.set_ylabel("Proto Margin")
@@ -447,9 +477,18 @@ def _plot_proto_confidence_overview(df, output_dir):
                 confusion_proto_ratio[true_idx, pred_idx] = np.nan
 
     import seaborn as sns
-    sns.heatmap(confusion_proto_ratio, annot=True, fmt=".2f", cmap="YlOrRd",
-                xticklabels=CLASS_LIST, yticklabels=CLASS_LIST, ax=ax,
-                vmin=0, vmax=1)
+
+    sns.heatmap(
+        confusion_proto_ratio,
+        annot=True,
+        fmt=".2f",
+        cmap="YlOrRd",
+        xticklabels=CLASS_LIST,
+        yticklabels=CLASS_LIST,
+        ax=ax,
+        vmin=0,
+        vmax=1,
+    )
     ax.set_title("Avg Proto Ratio per Confusion Pair\n(0=confident, 1=uncertain)")
     ax.set_xlabel("Predicted")
     ax.set_ylabel("True")
@@ -467,8 +506,10 @@ def _plot_proto_confidence_overview(df, output_dir):
     print(f"  Wrong avg proto_margin:    {df[~df['correct']]['proto_margin'].mean():.4f}")
     print(f"  Correct avg proto_ratio:   {df[df['correct']]['proto_ratio'].mean():.4f}")
     print(f"  Wrong avg proto_ratio:     {df[~df['correct']]['proto_ratio'].mean():.4f}")
-    print(f"  Uncertain (ratio>0.6):     {(df['proto_ratio'] > 0.6).sum()} samples "
-          f"({(df['proto_ratio'] > 0.6).mean()*100:.1f}%)")
+    print(
+        f"  Uncertain (ratio>0.6):     {(df['proto_ratio'] > 0.6).sum()} samples "
+        f"({(df['proto_ratio'] > 0.6).mean()*100:.1f}%)"
+    )
     print(f"  Very uncertain (ratio>0.7): {(df['proto_ratio'] > 0.7).sum()} samples")
 
 
@@ -510,8 +551,7 @@ def analyze_misclassifications(
 
     test_tf = get_transforms("val")
     test_ds = MalariaDataset(test_ann, img_base, transform=test_tf)
-    loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                         num_workers=4, pin_memory=True)
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     print("[Analysis V2] Running full inference with proto distances...")
     df = _run_full_inference_v2(ts, loader, device, test_ds, include_proto_dist)
@@ -528,8 +568,7 @@ def analyze_misclassifications(
 
     # Visualize misclassified
     print("[Analysis V2] Generating misclassification visualizations...")
-    _visualize_misclassified_v2(df_wrong, output_dir, max_per_pair=max_per_pair,
-                                show_proto_dist=True)
+    _visualize_misclassified_v2(df_wrong, output_dir, max_per_pair=max_per_pair, show_proto_dist=True)
 
     # Proto confidence overview
     print("[Analysis V2] Generating proto confidence overview plots...")
@@ -563,8 +602,7 @@ def quick_confidence_report(
 
     test_tf = get_transforms("val")
     test_ds = MalariaDataset(test_ann, img_base, transform=test_tf)
-    loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                         num_workers=4, pin_memory=True)
+    loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     print("[QuickReport] Running inference...")
     df = _run_full_inference_v2(ts, loader, device, test_ds)
@@ -576,12 +614,12 @@ def quick_confidence_report(
         "correct": int(df["correct"].sum()),
         "accuracy": float(df["correct"].mean()),
         "correct_proto_margin_mean": float(df[df["correct"]]["proto_margin"].mean()),
-        "wrong_proto_margin_mean":   float(df[~df["correct"]]["proto_margin"].mean()),
-        "correct_proto_ratio_mean":  float(df[df["correct"]]["proto_ratio"].mean()),
-        "wrong_proto_ratio_mean":    float(df[~df["correct"]]["proto_ratio"].mean()),
-        "uncertain_count":  int((df["proto_ratio"] > 0.6).sum()),
-        "very_uncertain":   int((df["proto_ratio"] > 0.7).sum()),
-        "highly_confident":  int((df["proto_ratio"] < 0.3).sum()),
+        "wrong_proto_margin_mean": float(df[~df["correct"]]["proto_margin"].mean()),
+        "correct_proto_ratio_mean": float(df[df["correct"]]["proto_ratio"].mean()),
+        "wrong_proto_ratio_mean": float(df[~df["correct"]]["proto_ratio"].mean()),
+        "uncertain_count": int((df["proto_ratio"] > 0.6).sum()),
+        "very_uncertain": int((df["proto_ratio"] > 0.7).sum()),
+        "highly_confident": int((df["proto_ratio"] < 0.3).sum()),
     }
 
     with open(os.path.join(output_dir, "confidence_summary.json"), "w") as f:
