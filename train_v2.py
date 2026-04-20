@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from calibration import TemperatureScaling, sanitize_temperature
 from dataset import MalariaDataset, get_transforms
-from losses import DynamicFocalLoss, PairConfusionPenalty, PrototypePushLoss, SupConLoss
+from losses import DynamicFocalLoss, ProtoRepulsionLoss, PrototypePushLoss, SupConLoss
 from model import MalariaProtoCLFv2, build_model, compute_class_prototypes
 
 warnings.filterwarnings("ignore")
@@ -59,11 +59,10 @@ class TrainConfigV2:
     OUTPUT_DIR = "/kaggle/working/malaria_proto_v2"
 
     # ── External baseline init (optional) ────────────────────────────────
-    # If set, trainer will load this checkpoint and skip Phase 1 training.
-    # Useful when you already have a strong baseline fine-tuned checkpoint.
-    INIT_FROM_CHECKPOINT = "/kaggle/input/datasets/hoanganh04/classification-models/convnext_tiny.pth"
-    SKIP_PHASE1_IF_INIT = True
-    INIT_ADAPT_EPOCHS = 2  # short adaptation to train proj_head before proto init
+    # Set to None to run full Phase 1 training from pretrained backbone.
+    INIT_FROM_CHECKPOINT = None  # None = train from scratch (recommended for fixes)
+    SKIP_PHASE1_IF_INIT = False
+    INIT_ADAPT_EPOCHS = 2
     INIT_ADAPT_LR = 1e-3
     INIT_ADAPT_BACKBONE_LR = 5e-6
 
@@ -80,44 +79,54 @@ class TrainConfigV2:
     LR = 3e-4
     WEIGHT_DECAY = 1e-4
     WARMUP_EPOCHS = 3
-    LABEL_SMOOTHING = 0.1  # mild label smoothing
+    LABEL_SMOOTHING = 0.1
 
     # ── ProtoCLR Fine-Tune (Phase 2) ───────────────────────────────────────
-    USE_PROTOCLR = True  # run ProtoCLR fine-tune after Phase 1
-    PROTOCLR_EPOCHS = 10
+    USE_PROTOCLR = True
+    PROTOCLR_EPOCHS = 12  # increased from 10 for better convergence
     PROTOCLR_LR_HEAD = 2e-4
     PROTOCLR_LR_BACK = 5e-6
-    PROTOCLR_ALPHA = 0.25  # prioritize classification signal for parasite recall
-    PUSH_WEIGHT = 0.08
-    PROTOCLR_CLF_LOSS = "focal"  # "focal" | "ce" | "asymmetric_ce"
-    PROTOCLR_LABEL_SMOOTHING = 0.0  # only used when PROTOCLR_CLF_LOSS="ce"
+    PROTOCLR_ALPHA = 0.25
+    PUSH_WEIGHT = 0.10   # increased from 0.08 — was too low, push never fired
+    PROTOCLR_CLF_LOSS = "focal"
+    PROTOCLR_LABEL_SMOOTHING = 0.0
 
     # ── Loss ───────────────────────────────────────────────────────────────
     SUPCON_TEMP = 0.07
-    CLF_LOSS = "focal"  # "focal" | "ce" | "asymmetric_ce"
-    MAJORITY_CLASS = 4  # Unparasitized
+    CLF_LOSS = "focal"
+    MAJORITY_CLASS = 4
     FOCAL_USE_CLASS_WEIGHTS = True
     FOCAL_CLASS_WEIGHT_POWER = 0.5
 
-    # ── Pair-aware TA/TJ penalty (directional) ───────────────────────────
-    # Current mapping in code: 0 = TJ, 1 = TA
-    ENABLE_TA_TJ_PAIR_LOSS = True
+    # ── ProtoRepulsion: push morphologically-similar class prototypes apart ─
+    # Replaces PairConfusionPenalty which was ATTRACTING TA toward TJ (wrong direction).
+    # ProtoRepulsion PUSHES TJ(0) and TA(1) prototypes apart → correct.
+    ENABLE_PROTO_REPULSION = True
+    REPULSION_WEIGHT = 0.15   # push TJ and TA prototypes apart
     TA_CLASS_IDX = 1
     TJ_CLASS_IDX = 0
-    PAIR_LOSS_MARGIN = 0.10
-    PAIR_LOSS_WEIGHT_P1 = 0.10
-    PAIR_LOSS_WEIGHT_P2 = 0.20
 
-    # Select checkpoint by global macro-F1 or parasite-only macro-F1 (classes 0..3)
-    BEST_MODEL_METRIC = "parasite_macro_f1"  # "macro_f1" | "parasite_macro_f1"
+    # ── Two-Stage Inference ───────────────────────────────────────────────
+    # Stage 1: Parasitized (0-3) vs Unparasitized (4) — most errors above are Unparasitized→Parasitized
+    # Stage 2: Only for parasitized → classify into TJ/TA/S/G
+    # Set to True to enable two-stage inference in evaluate.py
+    USE_TWO_STAGE_INFERENCE = True
+    TWO_STAGE_UNPARASITIZED_THRESHOLD = 0.5  # if P(Unparasitized) > this → stage-2 override
 
-    # ── Early stopping ────────────────────────────────────────────────────
+    # Select checkpoint by global macro-F1 or parasite-only macro-F1
+    BEST_MODEL_METRIC = "parasite_macro_f1"
+
+    # ── Early stopping ───────────────────────────────────────────────────
     EARLY_STOP_PATIENCE = 8
     EARLY_STOP_MIN_DELTA = 0.002
     EARLY_STOP_SMOOTH = 5
 
     # ── Calibration ───────────────────────────────────────────────────────
     DO_CALIBRATION = True
+
+    # ── Proto Debug ───────────────────────────────────────────────────────
+    # Log prototype distances every epoch → catch push=0.0 issues early
+    LOG_PROTO_DISTANCES = True
 
     # ── Misc ──────────────────────────────────────────────────────────────
     SEED = 42
@@ -127,13 +136,40 @@ class TrainConfigV2:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Weighted sampler
+# Weighted sampler with TA boosting
 # ─────────────────────────────────────────────────────────────────────────────
-def make_weighted_sampler(dataset):
+def make_weighted_sampler(dataset, class_counts, ta_boost: float = 8.0, minority_boost: float = 4.0):
+    """
+    Weighted random sampler — boosts minority classes for balanced training.
+
+    Args:
+        dataset: MalariaDataset
+        class_counts: list[int] sample counts per class
+        ta_boost: extra multiplier for TA (class 1) — the most confused class
+        minority_boost: extra multiplier for minority parasite classes (TJ, S, G)
+    """
     labels = [lbl for _, lbl in dataset.samples]
     counts = Counter(labels)
     n_total = len(labels)
-    weights = [n_total / counts[lbl] for lbl in labels]
+
+    # Base weight: inverse frequency
+    base_weights = {lbl: n_total / counts[lbl] for lbl in counts}
+
+    # Extra boost for minority parasite classes
+    # Class 0(TJ): 482, 1(TA): 117, 2(S): 215, 3(G): 101, 4(Unpar): 33486
+    PARASITE_CLASSES = [0, 1, 2, 3]
+    for cls_idx in PARASITE_CLASSES:
+        if cls_idx in base_weights:
+            base_weights[cls_idx] *= minority_boost
+
+    # Extra boost for TA specifically (most confused, smallest count)
+    base_weights[1] = base_weights.get(1, n_total) * ta_boost
+
+    # Unparasitized gets no boost (already dominant)
+    if 4 in base_weights:
+        base_weights[4] = n_total / counts.get(4, 1)
+
+    weights = [base_weights[lbl] for lbl in labels]
     return WeightedRandomSampler(weights, num_samples=n_total, replacement=True)
 
 
@@ -195,7 +231,9 @@ class TrainerV2SinglePhase:
         self.train_ds = MalariaDataset(cfg.TRAIN_ANN, cfg.IMG_BASE, transform=train_tf)
         self.val_ds = MalariaDataset(cfg.VAL_ANN, cfg.IMG_BASE, transform=val_tf)
 
-        sampler = make_weighted_sampler(self.train_ds)
+        sampler = make_weighted_sampler(
+            self.train_ds, self.class_counts, ta_boost=8.0, minority_boost=4.0
+        )
         self.train_loader = DataLoader(
             self.train_ds,
             batch_size=cfg.BATCH_SIZE,
@@ -319,12 +357,12 @@ class TrainerV2SinglePhase:
             adapt_best_state = copy.deepcopy(self.model.state_dict())
 
             for ep in range(1, cfg.INIT_ADAPT_EPOCHS + 1):
-                t_loss, t_pair = self._train_epoch_phase1(ep)
+                t_loss = self._train_epoch_phase1(ep)
                 v_loss, macro_f1, parasite_f1 = self._val_epoch_phase1()
                 monitor = self._select_monitor(macro_f1, parasite_f1)
                 print(
                     f"[InitAdapt] {ep:02d}/{cfg.INIT_ADAPT_EPOCHS} | "
-                    f"T {t_loss:.4f} pair:{t_pair:.4f} | V {v_loss:.4f} | "
+                    f"T {t_loss:.4f} | V {v_loss:.4f} | "
                     f"F1m {macro_f1:.4f} F1p {parasite_f1:.4f}"
                 )
                 if monitor > adapt_best:
@@ -385,12 +423,16 @@ class TrainerV2SinglePhase:
             self.clf_loss = nn.CrossEntropyLoss().to(self.device)
 
         self.supcon_loss = SupConLoss(temperature=cfg.SUPCON_TEMP).to(self.device)
-        self.push_loss = PrototypePushLoss(weight=cfg.PUSH_WEIGHT).to(self.device)
-        self.pair_loss = PairConfusionPenalty(
-            target_class_idx=cfg.TA_CLASS_IDX,
-            confusing_class_idx=cfg.TJ_CLASS_IDX,
-            margin=cfg.PAIR_LOSS_MARGIN,
-        ).to(self.device)
+        self.push_loss = PrototypePushLoss(margin=0.5, weight=cfg.PUSH_WEIGHT).to(self.device)
+
+        # ProtoRepulsionLoss pushes TJ and TA prototypes apart (replaces wrong PairConfusionPenalty)
+        if cfg.ENABLE_PROTO_REPULSION:
+            self.repulsion_loss = ProtoRepulsionLoss(
+                class_pairs=[(cfg.TJ_CLASS_IDX, cfg.TA_CLASS_IDX)],
+                weight=cfg.REPULSION_WEIGHT,
+            ).to(self.device)
+        else:
+            self.repulsion_loss = None
 
     # ── Phase 1: CE/Focal training ─────────────────────────────────────────
     def _run_phase1(self):
@@ -428,16 +470,15 @@ class TrainerV2SinglePhase:
         )
 
         for epoch in range(1, cfg.EPOCHS + 1):
-            t_loss, t_pair = self._train_epoch_phase1(epoch)
+            t_loss = self._train_epoch_phase1(epoch)
             v_loss, macro_f1, parasite_f1 = self._val_epoch_phase1()
             monitor = self._select_monitor(macro_f1, parasite_f1)
 
             if epoch > 1:
                 self.scheduler.step()
 
-            extra = f"pair:{t_pair:.4f}" if cfg.ENABLE_TA_TJ_PAIR_LOSS else ""
             self._log_epoch(
-                "P1", epoch, cfg.EPOCHS, t_loss, v_loss, macro_f1, parasite_f1, monitor, alpha=None, extra=extra
+                "P1", epoch, cfg.EPOCHS, t_loss, v_loss, macro_f1, parasite_f1, monitor, alpha=None, extra=""
             )
 
             if monitor > self.best_metric:
@@ -487,27 +528,24 @@ class TrainerV2SinglePhase:
 
     def _train_epoch_phase1(self, epoch):
         cfg = self.cfg
-        pair_weight = cfg.PAIR_LOSS_WEIGHT_P1 if cfg.ENABLE_TA_TJ_PAIR_LOSS else 0.0
 
         self.model.train()
-        total_loss, total_pair, n = 0.0, 0.0, 0
+        total_loss, n = 0.0, 0
         for imgs, labels in self.train_loader:
             imgs, labels = imgs.to(self.device), labels.to(self.device)
             self.optimizer.zero_grad()
             with autocast():
                 proj_feats, logits = self.model(imgs)
                 l_clf = self.clf_loss(logits, labels)
-                l_pair = self.pair_loss(logits, labels) if pair_weight > 0 else logits.new_zeros(())
-                loss = l_clf + pair_weight * l_pair
+                loss = l_clf
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             total_loss += loss.item()
-            total_pair += l_pair.item()
             n += 1
-        return total_loss / max(n, 1), total_pair / max(n, 1)
+        return total_loss / max(n, 1)
 
     @torch.no_grad()
     def _val_epoch_phase1(self):
@@ -602,7 +640,7 @@ class TrainerV2SinglePhase:
         p2_epochs = cfg.PROTOCLR_EPOCHS
 
         for epoch in range(1, p2_epochs + 1):
-            t_loss, t_sc, t_push, t_pair = self._train_epoch_protoclr(epoch)
+            t_loss, t_sc, t_push, t_repulse = self._train_epoch_protoclr(epoch)
             v_loss, macro_f1, parasite_f1 = self._val_epoch_protoclr()
             monitor = self._select_monitor(macro_f1, parasite_f1)
 
@@ -619,7 +657,7 @@ class TrainerV2SinglePhase:
                 parasite_f1,
                 monitor,
                 alpha=cfg.PROTOCLR_ALPHA,
-                extra=f"SC:{t_sc:.4f} push:{t_push:.4f} pair:{t_pair:.4f}",
+                extra=f"SC:{t_sc:.4f} push:{t_push:.4f} repel:{t_repulse:.4f}",
             )
 
             # [BUGFIX-1] Reset es counter AFTER saving best_state, not inside the if-block
@@ -631,13 +669,12 @@ class TrainerV2SinglePhase:
         print(f"\n[Phase 2] Best monitor ({cfg.BEST_MODEL_METRIC}): {self.best_metric:.4f}")
 
     def _train_epoch_protoclr(self, epoch):
-        """Combined SupCon + CE + PushLoss for ProtoCLR."""
+        """Combined SupCon + CE + PushLoss + ProtoRepulsion for ProtoCLR."""
         cfg = self.cfg
         alpha = cfg.PROTOCLR_ALPHA
-        pair_weight = cfg.PAIR_LOSS_WEIGHT_P2 if cfg.ENABLE_TA_TJ_PAIR_LOSS else 0.0
 
         self.model.train()
-        total_loss, total_sc, total_push, total_pair, n = 0.0, 0.0, 0.0, 0.0, 0
+        total_loss, total_sc, total_push, total_repulse, n = 0.0, 0.0, 0.0, 0.0, 0
 
         for imgs, labels in self.train_loader:
             imgs, labels = imgs.to(self.device), labels.to(self.device)
@@ -648,9 +685,14 @@ class TrainerV2SinglePhase:
 
                 l_sc = self.supcon_loss(proj_feats, labels)
                 l_clf = self.clf_loss(logits, labels)
-                l_push = self.push_loss(self.model.clf_head.prototypes)
-                l_pair = self.pair_loss(logits, labels) if pair_weight > 0 else logits.new_zeros(())
-                loss = alpha * l_sc + (1.0 - alpha) * l_clf + l_push + pair_weight * l_pair
+                l_push, push_debug = self.push_loss(self.model.clf_head.prototypes)
+                l_repulse = 0.0
+                if self.repulsion_loss is not None:
+                    l_repulse, repulse_debug = self.repulsion_loss(self.model.clf_head.prototypes)
+                else:
+                    l_repulse = logits.new_zeros(())
+
+                loss = alpha * l_sc + (1.0 - alpha) * l_clf + l_push + l_repulse
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -661,10 +703,29 @@ class TrainerV2SinglePhase:
             total_loss += loss.item()
             total_sc += l_sc.item()
             total_push += l_push.item()
-            total_pair += l_pair.item()
+            total_repulse += l_repulse.item()
             n += 1
 
-        return total_loss / max(n, 1), total_sc / max(n, 1), total_push / max(n, 1), total_pair / max(n, 1)
+        # ── Proto distance logging (debugging push=0.0 issues) ────────────────
+        if cfg.LOG_PROTO_DISTANCES and n > 0:
+            with torch.no_grad():
+                P = F.normalize(self.model.clf_head.prototypes, dim=1)
+                sim = torch.matmul(P, P.T) - torch.eye(P.shape[0], device=P.device)
+                min_sim = sim.min().item()
+                max_sim = sim.max().item()
+                # Pair-specific: TJ(0) vs TA(1)
+                tj_ta_sim = torch.dot(P[0], P[1]).item()
+            print(
+                f"         [Proto] TJ-TA sim={tj_ta_sim:.4f} (dist={1-tj_ta_sim:.4f}), "
+                f"inter-proto min_sim={min_sim:.4f} max_sim={max_sim:.4f}"
+            )
+
+        return (
+            total_loss / max(n, 1),
+            total_sc / max(n, 1),
+            total_push / max(n, 1),
+            total_repulse / max(n, 1),
+        )
 
     @torch.no_grad()
     def _val_epoch_protoclr(self):
@@ -719,10 +780,10 @@ class TrainerV2SinglePhase:
             f"back_lr={cfg.PROTOCLR_LR_BACK}, push={cfg.PUSH_WEIGHT}, metric={cfg.BEST_MODEL_METRIC}"
         )
         print(
-            f"  Pair TA->TJ: {cfg.ENABLE_TA_TJ_PAIR_LOSS} "
-            f"(TA={cfg.TA_CLASS_IDX}, TJ={cfg.TJ_CLASS_IDX}, margin={cfg.PAIR_LOSS_MARGIN}, "
-            f"w_p1={cfg.PAIR_LOSS_WEIGHT_P1}, w_p2={cfg.PAIR_LOSS_WEIGHT_P2})"
+            f"  ProtoRepulsion: {cfg.ENABLE_PROTO_REPULSION} "
+            f"(TJ={cfg.TJ_CLASS_IDX}, TA={cfg.TA_CLASS_IDX}, weight={cfg.REPULSION_WEIGHT})"
         )
+        print(f"  Two-stage inference: {cfg.USE_TWO_STAGE_INFERENCE}")
         print(f"  Classes: {cfg.NUM_CLASSES} | Imbalance: {self.class_counts}")
         print(f"{'='*60}")
 

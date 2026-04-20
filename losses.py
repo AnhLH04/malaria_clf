@@ -205,45 +205,113 @@ class CombinedLoss(nn.Module):
 # ─────────────────────────────────────────────
 # Prototype Push-Away Loss
 # ─────────────────────────────────────────────
+class ProtoRepulsionLoss(nn.Module):
+    """
+    Maximizes cosine distance between specific class prototypes.
+
+    Unlike PairConfusionPenalty (penalizes logit overlap per-sample),
+    this loss directly pushes prototypes apart in embedding space.
+
+    Use when two classes are easily confused → make their centers far apart.
+    For malaria: TJ vs TA (class 0 vs 1) are morphologically similar.
+
+    Loss = -cosine_similarity(proto_i, proto_j)  (push similarity → -1)
+    """
+
+    def __init__(self, class_pairs: list[tuple[int, int]], weight: float = 0.1):
+        """
+        Args:
+            class_pairs: list of (class_i, class_j) pairs to push apart
+            weight: scalar weight for the combined loss
+        """
+        super().__init__()
+        self.class_pairs = [(int(a), int(b)) for a, b in class_pairs]
+        self.weight = weight
+
+    def forward(self, prototypes: nn.Parameter) -> tuple[torch.Tensor, dict]:
+        """
+        prototypes: (C, D) L2-normalized prototype parameters
+        Returns: (weighted_loss, debug_dict)
+        """
+        P = F.normalize(prototypes, dim=1)  # (C, D)
+        total = torch.zeros((), device=P.device)
+        activations = 0
+        pair_details = {}
+
+        for i, j in self.class_pairs:
+            sim = torch.dot(P[i], P[j])  # cosine similarity (normalized)
+            # Repulsion: penalize when sim > -margin (i.e. too close or same direction)
+            # We want sim ≤ -margin → proto far apart (≥ 90° for margin=0)
+            margin = 0.1
+            violation = F.relu(sim + margin)  # zero when sim ≤ -margin (good)
+            total = total + violation
+            activations += (violation.item() > 1e-6)
+            pair_details[f"pair_{i}_{j}"] = {
+                "sim": sim.item(),
+                "dist": (1 - sim).item(),  # cosine distance
+                "violation": violation.item(),
+            }
+
+        n_pairs = len(self.class_pairs)
+        loss = (total / n_pairs) * self.weight
+        return loss, {"total_violations": activations, "n_pairs": n_pairs, **pair_details}
+
+
+# ─────────────────────────────────────────────
+# Prototype Push-Away Loss (refactored)
+# ─────────────────────────────────────────────
 class PrototypePushLoss(nn.Module):
     """
-    Penalises excessive cosine similarity between prototypes of different classes.
+    Penalises excessive cosine similarity between all pairs of class prototypes.
 
     Usage:
-        push_loss = PrototypePushLoss(weight=0.05)
-        loss = push_loss(prototype_params)   # prototype_params: nn.Parameter tensor (C, D)
+        push_loss = PrototypePushLoss(margin=0.5, weight=0.05)
+        loss = push_loss(prototype_params)
 
-    The loss is non-redundant with SupCon because SupCon operates on per-batch pairs,
-    whereas this loss directly minimises inter-class prototype similarity globally.
+    V2 changes from v1:
+      • Default margin raised from 0.3 → 0.5 (0.3 was too strict → never fired)
+      • Reports activation rate for debugging
+      • Uses mean instead of sum (scale-independent)
     """
 
-    def __init__(self, margin: float = 0.3, weight: float = 0.05):
+    def __init__(self, margin: float = 0.5, weight: float = 0.05):
         """
         Args:
             margin:  desired minimum cosine distance between any two prototypes.
-                     Higher margin → more separated classes.
+                     cos_dist = 1 - sim ≥ margin → sim ≤ 1 - margin
+                     Default 0.5 means prototypes must be ≥ 60° apart.
             weight:  scalar weight multiplied onto the loss in the combined objective.
         """
         super().__init__()
         self.margin = margin
         self.weight = weight
 
-    def forward(self, prototypes: nn.Parameter) -> torch.Tensor:
+    def forward(self, prototypes: nn.Parameter) -> tuple[torch.Tensor, dict]:
         """
         prototypes: (C, D) L2-normalized class prototype vectors.
-        Returns: scalar push-loss (scaled by self.weight).
+        Returns: (weighted_loss, debug_dict)
         """
         P = F.normalize(prototypes, dim=1)  # (C, D)
         sim = torch.matmul(P, P.T)  # (C, C)
         # Zero out diagonal (self-similarity = 1.0 by definition)
         sim = sim - torch.eye(P.shape[0], device=P.device)
         # Penalise any pair with similarity above (1 - margin)
-        threshold = 1.0 - self.margin
+        threshold = 1.0 - self.margin  # sim > threshold → violation
         violation = torch.clamp_min(sim - threshold, min=0.0)
         # Average over all off-diagonal pairs
         n_pairs = P.shape[0] * (P.shape[0] - 1)
         loss = violation.sum() / n_pairs
-        return self.weight * loss
+
+        # Debug info
+        off_diag = sim.abs()  # ignore sign for count
+        n_violations = (violation > 1e-6).sum().item()
+        return self.weight * loss, {
+            "raw_loss": loss.item(),
+            "n_violations": n_violations,
+            "max_sim": sim.max().item(),
+            "min_sim": sim.min().item(),
+            "mean_sim": sim.abs().mean().item(),
+        }
 
 
 class PairConfusionPenalty(nn.Module):

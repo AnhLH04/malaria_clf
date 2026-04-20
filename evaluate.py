@@ -94,7 +94,7 @@ def load_model(checkpoint_path, device):
 # ─────────────────────────────────────────────
 @torch.no_grad()
 def run_inference(ts_model, loader, device):
-    all_probs, all_preds, all_labels, all_paths = [], [], [], []
+    all_probs, all_preds, all_labels = [], [], []
 
     for batch_idx, (imgs, labels) in enumerate(loader):
         imgs = imgs.to(device)
@@ -109,6 +109,59 @@ def run_inference(ts_model, loader, device):
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
 
+    return all_probs, all_preds, all_labels
+
+
+@torch.no_grad()
+def run_inference_two_stage(ts_model, loader, device, unparasitized_threshold: float = 0.5):
+    """
+    Two-stage inference to reduce Unparasitized → TJ false positives.
+
+    Stage 1: If P(Unparasitized) > threshold → classify as Unparasitized (early exit).
+    Stage 2: Otherwise → use full 5-class argmax to distinguish parasite types.
+
+    Root cause of failures (from GradCAM analysis):
+      - proto_margin < 0 (embedding closer to TJ proto than Unparasitized proto)
+      - proto_ratio ≈ 0.28 (not close enough to Unparasitized prototype)
+    These Unparasitized cells have slightly similar morphology to TJ → two-stage
+    provides a stronger prior for the dominant negative class.
+
+    Args:
+        ts_model: TemperatureScaling model
+        loader: test DataLoader
+        device: torch device
+        unparasitized_threshold: P(Unparasitized) cutoff for stage-1 early exit
+    Returns:
+        (all_probs, all_preds, all_labels) numpy arrays
+    """
+    UNPARASITIZED_CLASS = 4
+    all_probs, all_preds, all_labels = [], [], []
+
+    for imgs, labels in loader:
+        imgs = imgs.to(device)
+        logits = ts_model(imgs)
+        probs = F.softmax(logits, dim=1).cpu().numpy()  # (B, 5)
+
+        preds = probs.argmax(axis=1).copy()  # initial argmax prediction
+
+        # Stage 1 override: if P(Unparasitized) is high enough → force Unparasitized
+        unpara_prob = probs[:, UNPARASITIZED_CLASS]
+        high_unparasitized = unpara_prob >= unparasitized_threshold
+        preds[high_unparasitized] = UNPARASITIZED_CLASS
+
+        all_probs.append(probs)
+        all_preds.extend(preds)
+        all_labels.extend(labels.numpy())
+
+    all_probs = np.concatenate(all_probs, axis=0)
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    n_stage1 = (all_probs[:, UNPARASITIZED_CLASS] >= unparasitized_threshold).sum()
+    print(
+        f"[TwoStage] Stage-1 early exits (P(Unpar)≥{unparasitized_threshold}): "
+        f"{n_stage1}/{len(all_preds)} ({100*n_stage1/len(all_preds):.1f}%)"
+    )
     return all_probs, all_preds, all_labels
 
 
@@ -303,13 +356,29 @@ def plot_per_class_f1(preds, labels, output_dir):
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
-def evaluate(checkpoint_path, test_ann, img_base, output_dir, batch_size=64):
+def evaluate(
+    checkpoint_path,
+    test_ann,
+    img_base,
+    output_dir,
+    batch_size=64,
+    two_stage: bool = True,
+    unparasitized_threshold: float = 0.5,
+):
+    """
+    Full evaluation pipeline.
+
+    Args:
+        two_stage: enable two-stage inference (recommended: True)
+        unparasitized_threshold: P(Unparasitized) cutoff for stage-1 early exit
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Eval] Device: {device}")
 
     # Load model
     ts_model, temperature = load_model(checkpoint_path, device)
     print(f"[Eval] Temperature: {temperature:.4f}")
+    print(f"[Eval] Two-stage inference: {two_stage} (unparasitized_threshold={unparasitized_threshold})")
 
     # Dataset
     test_tf = get_transforms("val")
@@ -317,7 +386,12 @@ def evaluate(checkpoint_path, test_ann, img_base, output_dir, batch_size=64):
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     # Inference
-    probs, preds, labels = run_inference(ts_model, test_loader, device)
+    if two_stage:
+        probs, preds, labels = run_inference_two_stage(
+            ts_model, test_loader, device, unparasitized_threshold=unparasitized_threshold
+        )
+    else:
+        probs, preds, labels = run_inference(ts_model, test_loader, device)
 
     # Metrics
     summary = compute_metrics(probs, preds, labels, output_dir)
@@ -339,6 +413,9 @@ if __name__ == "__main__":
     parser.add_argument("--img_base", required=True)
     parser.add_argument("--output_dir", default="eval_results")
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--two_stage", action="store_true", default=True)
+    parser.add_argument("--no_two_stage", dest="two_stage", action="store_false")
+    parser.add_argument("--unparasitized_threshold", type=float, default=0.5)
     args = parser.parse_args()
 
     evaluate(
@@ -347,4 +424,6 @@ if __name__ == "__main__":
         img_base=args.img_base,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
+        two_stage=args.two_stage,
+        unparasitized_threshold=args.unparasitized_threshold,
     )

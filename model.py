@@ -91,6 +91,16 @@ class PrototypeHead(nn.Module):
         sim = torch.matmul(z, proto_norm[:, target_idx:target_idx+1])  # (B, 1)
         return 1 - sim.squeeze(-1)
 
+    def get_inter_proto_distances(self) -> torch.Tensor:
+        """
+        Trả về cosine distance matrix giữa tất cả class prototypes.
+        Dùng để debug: kiểm tra push loss có hoạt động không.
+        Returns: (C, C) matrix, diagonal = 0
+        """
+        P = F.normalize(self.prototypes, dim=1)
+        sim = torch.matmul(P, P.T)
+        return 1 - sim  # cosine distance
+
 
 # ─────────────────────────────────────────────
 # Dual Head (Prototype + FC)
