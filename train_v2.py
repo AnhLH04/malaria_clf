@@ -87,7 +87,7 @@ class TrainConfigV2:
     PROTOCLR_LR_HEAD = 2e-4
     PROTOCLR_LR_BACK = 5e-6
     PROTOCLR_ALPHA = 0.25
-    PUSH_WEIGHT = 0.10   # increased from 0.08 — was too low, push never fired
+    PUSH_WEIGHT = 0.10  # increased from 0.08 — was too low, push never fired
     PROTOCLR_CLF_LOSS = "focal"
     PROTOCLR_LABEL_SMOOTHING = 0.0
 
@@ -102,7 +102,7 @@ class TrainConfigV2:
     # Replaces PairConfusionPenalty which was ATTRACTING TA toward TJ (wrong direction).
     # ProtoRepulsion PUSHES TJ(0) and TA(1) prototypes apart → correct.
     ENABLE_PROTO_REPULSION = True
-    REPULSION_WEIGHT = 0.15   # push TJ and TA prototypes apart
+    REPULSION_WEIGHT = 0.15  # push TJ and TA prototypes apart
     TA_CLASS_IDX = 1
     TJ_CLASS_IDX = 0
 
@@ -204,8 +204,6 @@ class TrainerV2SinglePhase:
         self.device = torch.device(cfg.DEVICE)
 
         self._setup_data()
-        self.class_counts = self._build_class_counts()
-        self._setup_loss()
 
         self.scaler = GradScaler()
         self.best_metric = 0.0
@@ -231,9 +229,10 @@ class TrainerV2SinglePhase:
         self.train_ds = MalariaDataset(cfg.TRAIN_ANN, cfg.IMG_BASE, transform=train_tf)
         self.val_ds = MalariaDataset(cfg.VAL_ANN, cfg.IMG_BASE, transform=val_tf)
 
-        sampler = make_weighted_sampler(
-            self.train_ds, self.class_counts, ta_boost=8.0, minority_boost=4.0
-        )
+        # Build class counts first — needed by make_weighted_sampler
+        self.class_counts = self._build_class_counts()
+
+        sampler = make_weighted_sampler(self.train_ds, self.class_counts, ta_boost=8.0, minority_boost=4.0)
         self.train_loader = DataLoader(
             self.train_ds,
             batch_size=cfg.BATCH_SIZE,
