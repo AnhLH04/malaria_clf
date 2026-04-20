@@ -24,10 +24,11 @@ Cách dùng:
 """
 
 import copy
+
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import cv2
 from matplotlib import cm
 from PIL import Image
 
@@ -93,7 +94,7 @@ class GradCAM:
 
         # weights = global average pooling over gradients
         grads = self.gradients  # (1, C, H, W)
-        acts  = self.activations  # (1, C, H', W')
+        acts = self.activations  # (1, C, H', W')
 
         weights = grads.mean(dim=(2, 3), keepdim=True)  # (1, C, 1, 1)
         cam = (weights * acts).sum(dim=1, keepdim=True)  # (1, 1, H', W')
@@ -132,9 +133,7 @@ class GradCAMInterpreter:
         return probs.tolist()
 
     @torch.enable_grad()
-    def generate_overlay(self, image_tensor: torch.Tensor,
-                         class_idx: int | None = None,
-                         alpha: float = 0.4):
+    def generate_overlay(self, image_tensor: torch.Tensor, class_idx: int | None = None, alpha: float = 0.4):
         """
         Tạo ảnh overlay: heatmap GradCAM + original image.
         Trả về PIL Image.
@@ -145,7 +144,7 @@ class GradCAMInterpreter:
         img_np = image_tensor.squeeze().cpu().numpy()
         img_np = img_np.transpose(1, 2, 0)
         mean = np.array([0.485, 0.456, 0.406])
-        std  = np.array([0.229, 0.224, 0.225])
+        std = np.array([0.229, 0.224, 0.225])
         img_np = img_np * std + mean
         img_np = np.clip(img_np, 0, 1)
 
@@ -166,7 +165,7 @@ class GradCAMInterpreter:
         """
         overlays = []
         for i in range(len(images)):
-            inp = images[i:i+1].to(next(self.model.parameters()).device)
+            inp = images[i : i + 1].to(next(self.model.parameters()).device)
             overlay = self.generate_overlay(inp, class_indices[i])
             overlays.append(overlay)
         return overlays
@@ -192,19 +191,37 @@ class PrototypeHeatmapGenerator:
     def __init__(self, model: torch.nn.Module):
         self.model = copy.deepcopy(model)
         self.model.eval()
-        self.feature_maps: torch.Tensor | None = None
-        self._register_hook()
 
-    def _register_hook(self):
-        """Hook vào output của backbone (sau global pool được remove)."""
-        def forward_hook(module, input, output):
-            self.feature_maps = output.detach()
-
+    def _extract_spatial_feature_map(self, inp: torch.Tensor) -> torch.Tensor:
+        """Return backbone features as spatial map (B, C, H, W)."""
         backbone = self.model.backbone
-        # ConvNeXt: lấy output của stage cuối trước global pool
-        # forward hook trên forward_features output
-        backbone.global_pool = torch.nn.Identity()
-        backbone.register_forward_hook(forward_hook)
+
+        if hasattr(backbone, "forward_features"):
+            feats = backbone.forward_features(inp)
+        else:
+            feats = backbone(inp)
+
+        # Some backbones may already return pooled vectors (B, C).
+        # Keep code robust by treating them as a 1x1 spatial map.
+        if feats.dim() == 2:
+            feats = feats.unsqueeze(-1).unsqueeze(-1)
+
+        if feats.dim() != 4:
+            raise RuntimeError(f"Expected spatial features with shape (B, C, H, W), got {tuple(feats.shape)}")
+
+        return feats
+
+    def _get_fc_weight(self):
+        """Return final linear weight for FC-head fallback."""
+        fc = self.model.clf_head
+        if hasattr(fc, "weight"):
+            return fc.weight
+
+        # MalariaProtoCLFv2 FC head is nn.Sequential(..., Linear)
+        linear_layers = [m for m in fc.modules() if isinstance(m, torch.nn.Linear)]
+        if not linear_layers:
+            raise RuntimeError("Cannot find Linear layer in clf_head for FC fallback")
+        return linear_layers[-1].weight
 
     @torch.no_grad()
     def generate_spatial_maps(self, input_tensor: torch.Tensor):
@@ -216,45 +233,50 @@ class PrototypeHeatmapGenerator:
         inp = input_tensor.to(next(self.model.parameters()).device)
 
         # Forward để lấy feature maps
-        feats = self.model.backbone(inp)  # (1, feat_dim, H', W')
+        feats = self._extract_spatial_feature_map(inp)  # (1, feat_dim, H', W')
 
         # Project từng spatial position
-        proj = self.model.proj_head  # Linear: feat_dim → proj_dim
-        spatial_feats = proj(feats.flatten(2).transpose(1, 2))  # (1, H'*W', proj_dim)
+        spatial_tokens = feats.flatten(2).transpose(1, 2)  # (1, H'*W', feat_dim)
+        proj = self.model.proj_head  # MLP: feat_dim → proj_dim
+        spatial_feats = proj(spatial_tokens)  # (1, H'*W', proj_dim)
         spatial_feats = F.normalize(spatial_feats, dim=-1)  # L2 normalize
 
         # Prototype vectors (đã normalize)
-        if hasattr(self.model, 'clf_head') and hasattr(self.model.clf_head, 'prototypes'):
+        if hasattr(self.model, "clf_head") and hasattr(self.model.clf_head, "prototypes"):
             prototypes = F.normalize(self.model.clf_head.prototypes, dim=1)  # (num_classes, proj_dim)
         else:
-            # FC head fallback: dùng last layer weights như proxy
-            fc = self.model.clf_head
-            prototypes = F.normalize(fc.weight, dim=1)  # (num_classes, feat_dim)
-            spatial_feats_flat = feats.flatten(2).transpose(1, 2)  # (1, H'*W', feat_dim)
-            spatial_feats_flat = F.normalize(spatial_feats_flat, dim=-1)
-            spatial_feats = spatial_feats_flat
+            # FC head fallback: dùng last linear weights như class proxies.
+            prototypes = F.normalize(self._get_fc_weight(), dim=1)  # (num_classes, D)
+
+        # Ensure feature/prototype dimensions match.
+        if spatial_feats.shape[-1] != prototypes.shape[-1]:
+            spatial_feats = F.normalize(spatial_tokens, dim=-1)
+            if spatial_feats.shape[-1] != prototypes.shape[-1]:
+                raise RuntimeError(
+                    "Dimension mismatch between spatial features and class vectors: "
+                    f"{spatial_feats.shape[-1]} vs {prototypes.shape[-1]}"
+                )
 
         # Cosine similarity: (1, H'*W', proj_dim) @ (num_classes, proj_dim).T
         #                     = (1, H'*W', num_classes)
         sim = torch.matmul(spatial_feats, prototypes.T).squeeze(0)  # (H'*W', num_classes)
+        sim = ((sim + 1.0) / 2.0).clamp(0.0, 1.0)
         sim = sim.cpu().numpy()  # mỗi cột = similarity map flatten
 
         H, W = feats.shape[2:]
         from dataset import CLASS_NAMES
+
         result = {}
         for cls_idx in range(prototypes.shape[0]):
             cls_name = CLASS_NAMES.get(cls_idx, f"Class_{cls_idx}")
             result[cls_name] = sim[:, cls_idx].reshape(H, W)
             # Upsample to input size
-            result[cls_name] = cv2.resize(
-                result[cls_name], (input_tensor.shape[3], input_tensor.shape[2])
-            )
+            result[cls_name] = cv2.resize(result[cls_name], (input_tensor.shape[3], input_tensor.shape[2]))
 
         return result
 
     @torch.no_grad()
-    def overlay_spatial_maps(self, input_tensor: torch.Tensor,
-                             alpha: float = 0.5):
+    def overlay_spatial_maps(self, input_tensor: torch.Tensor, alpha: float = 0.5):
         """
         Tạo grid overlay: mỗi cell = spatial map cho 1 class.
         Returns: PIL Image (grid 1×5 hoặc 2×3).
@@ -264,10 +286,11 @@ class PrototypeHeatmapGenerator:
         # Denormalize input
         img_np = input_tensor.squeeze().cpu().numpy().transpose(1, 2, 0)
         mean = np.array([0.485, 0.456, 0.406])
-        std  = np.array([0.229, 0.224, 0.225])
+        std = np.array([0.229, 0.224, 0.225])
         img_np = np.clip(img_np * std + mean, 0, 1)
 
         import matplotlib.pyplot as plt
+
         n_classes = len(spatial_maps)
         cols = min(5, n_classes)
         rows = (n_classes + cols - 1) // cols
@@ -300,6 +323,7 @@ class PrototypeHeatmapGenerator:
 
         plt.tight_layout()
         from io import BytesIO
+
         buf = BytesIO()
         plt.savefig(buf, format="png", dpi=130, bbox_inches="tight")
         buf.seek(0)
@@ -316,14 +340,12 @@ class MalariaInterpreter:
     Dùng trong evaluate / misclassification analysis để giải thích kết quả.
     """
 
-    def __init__(self, model: torch.nn.Module,
-                 target_layer_name: str = "backbone.stages.3"):
+    def __init__(self, model: torch.nn.Module, target_layer_name: str = "backbone.stages.3"):
         self.gradcam = GradCAMInterpreter(model, target_layer_name)
         self.spatial = PrototypeHeatmapGenerator(model)
 
     @torch.no_grad()
-    def explain_sample(self, image_tensor: torch.Tensor,
-                       true_label: int | None = None):
+    def explain_sample(self, image_tensor: torch.Tensor, true_label: int | None = None):
         """
         Trả về dict chứa đầy đủ thông tin giải thích cho 1 sample.
 
@@ -339,6 +361,7 @@ class MalariaInterpreter:
             }
         """
         from dataset import CLASS_NAMES
+
         device = next(self.model.parameters()).device
 
         # 1. Prototype similarities (softmax probabilities)
@@ -375,7 +398,7 @@ class MalariaInterpreter:
         """Explain nhiều samples, trả về list dict."""
         results = []
         for i in range(len(images)):
-            inp = images[i:i+1].to(next(self.gradcam.model.parameters()).device)
+            inp = images[i : i + 1].to(next(self.gradcam.model.parameters()).device)
             true_lbl = labels[i] if labels is not None else None
             results.append(self.explain_sample(inp, true_lbl))
         return results
