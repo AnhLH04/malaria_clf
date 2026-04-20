@@ -246,6 +246,38 @@ class PrototypePushLoss(nn.Module):
         return self.weight * loss
 
 
+class PairConfusionPenalty(nn.Module):
+    """
+    Directional margin penalty for a confusion pair.
+
+    For samples whose true label is `target_class_idx`, penalize when
+    `confusing_class_idx` logit is too close to (or higher than) target logit.
+
+    Loss per sample:
+        relu(logit_confusing - logit_target + margin)
+    """
+
+    def __init__(self, target_class_idx: int, confusing_class_idx: int, margin: float = 0.1):
+        super().__init__()
+        self.target_class_idx = int(target_class_idx)
+        self.confusing_class_idx = int(confusing_class_idx)
+        self.margin = float(margin)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        logits:  (B, C)
+        targets: (B,)
+        """
+        mask = targets == self.target_class_idx
+        if not mask.any():
+            return logits.new_zeros(())
+
+        target_logits = logits[mask, self.target_class_idx]
+        confusing_logits = logits[mask, self.confusing_class_idx]
+        loss = F.relu(confusing_logits - target_logits + self.margin)
+        return loss.mean()
+
+
 # ─────────────────────────────────────────────
 # Smoothed Early Stopping
 # ─────────────────────────────────────────────

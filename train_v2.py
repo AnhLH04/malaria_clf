@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from calibration import TemperatureScaling, sanitize_temperature
 from dataset import MalariaDataset, get_transforms
-from losses import DynamicFocalLoss, PrototypePushLoss, SupConLoss
+from losses import DynamicFocalLoss, PairConfusionPenalty, PrototypePushLoss, SupConLoss
 from model import MalariaProtoCLFv2, build_model, compute_class_prototypes
 
 warnings.filterwarnings("ignore")
@@ -98,6 +98,15 @@ class TrainConfigV2:
     MAJORITY_CLASS = 4  # Unparasitized
     FOCAL_USE_CLASS_WEIGHTS = True
     FOCAL_CLASS_WEIGHT_POWER = 0.5
+
+    # ── Pair-aware TA/TJ penalty (directional) ───────────────────────────
+    # Current mapping in code: 0 = TJ, 1 = TA
+    ENABLE_TA_TJ_PAIR_LOSS = True
+    TA_CLASS_IDX = 1
+    TJ_CLASS_IDX = 0
+    PAIR_LOSS_MARGIN = 0.10
+    PAIR_LOSS_WEIGHT_P1 = 0.10
+    PAIR_LOSS_WEIGHT_P2 = 0.20
 
     # Select checkpoint by global macro-F1 or parasite-only macro-F1 (classes 0..3)
     BEST_MODEL_METRIC = "parasite_macro_f1"  # "macro_f1" | "parasite_macro_f1"
@@ -310,12 +319,12 @@ class TrainerV2SinglePhase:
             adapt_best_state = copy.deepcopy(self.model.state_dict())
 
             for ep in range(1, cfg.INIT_ADAPT_EPOCHS + 1):
-                t_loss = self._train_epoch_phase1(ep)
+                t_loss, t_pair = self._train_epoch_phase1(ep)
                 v_loss, macro_f1, parasite_f1 = self._val_epoch_phase1()
                 monitor = self._select_monitor(macro_f1, parasite_f1)
                 print(
                     f"[InitAdapt] {ep:02d}/{cfg.INIT_ADAPT_EPOCHS} | "
-                    f"T {t_loss:.4f} | V {v_loss:.4f} | "
+                    f"T {t_loss:.4f} pair:{t_pair:.4f} | V {v_loss:.4f} | "
                     f"F1m {macro_f1:.4f} F1p {parasite_f1:.4f}"
                 )
                 if monitor > adapt_best:
@@ -377,6 +386,11 @@ class TrainerV2SinglePhase:
 
         self.supcon_loss = SupConLoss(temperature=cfg.SUPCON_TEMP).to(self.device)
         self.push_loss = PrototypePushLoss(weight=cfg.PUSH_WEIGHT).to(self.device)
+        self.pair_loss = PairConfusionPenalty(
+            target_class_idx=cfg.TA_CLASS_IDX,
+            confusing_class_idx=cfg.TJ_CLASS_IDX,
+            margin=cfg.PAIR_LOSS_MARGIN,
+        ).to(self.device)
 
     # ── Phase 1: CE/Focal training ─────────────────────────────────────────
     def _run_phase1(self):
@@ -414,14 +428,17 @@ class TrainerV2SinglePhase:
         )
 
         for epoch in range(1, cfg.EPOCHS + 1):
-            t_loss = self._train_epoch_phase1(epoch)
+            t_loss, t_pair = self._train_epoch_phase1(epoch)
             v_loss, macro_f1, parasite_f1 = self._val_epoch_phase1()
             monitor = self._select_monitor(macro_f1, parasite_f1)
 
             if epoch > 1:
                 self.scheduler.step()
 
-            self._log_epoch("P1", epoch, cfg.EPOCHS, t_loss, v_loss, macro_f1, parasite_f1, monitor, alpha=None)
+            extra = f"pair:{t_pair:.4f}" if cfg.ENABLE_TA_TJ_PAIR_LOSS else ""
+            self._log_epoch(
+                "P1", epoch, cfg.EPOCHS, t_loss, v_loss, macro_f1, parasite_f1, monitor, alpha=None, extra=extra
+            )
 
             if monitor > self.best_metric:
                 self.best_metric = monitor
@@ -469,22 +486,28 @@ class TrainerV2SinglePhase:
             )
 
     def _train_epoch_phase1(self, epoch):
+        cfg = self.cfg
+        pair_weight = cfg.PAIR_LOSS_WEIGHT_P1 if cfg.ENABLE_TA_TJ_PAIR_LOSS else 0.0
+
         self.model.train()
-        total_loss, n = 0.0, 0
+        total_loss, total_pair, n = 0.0, 0.0, 0
         for imgs, labels in self.train_loader:
             imgs, labels = imgs.to(self.device), labels.to(self.device)
             self.optimizer.zero_grad()
             with autocast():
                 proj_feats, logits = self.model(imgs)
-                loss = self.clf_loss(logits, labels)
+                l_clf = self.clf_loss(logits, labels)
+                l_pair = self.pair_loss(logits, labels) if pair_weight > 0 else logits.new_zeros(())
+                loss = l_clf + pair_weight * l_pair
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             total_loss += loss.item()
+            total_pair += l_pair.item()
             n += 1
-        return total_loss / max(n, 1)
+        return total_loss / max(n, 1), total_pair / max(n, 1)
 
     @torch.no_grad()
     def _val_epoch_phase1(self):
@@ -579,7 +602,7 @@ class TrainerV2SinglePhase:
         p2_epochs = cfg.PROTOCLR_EPOCHS
 
         for epoch in range(1, p2_epochs + 1):
-            t_loss, t_sc, t_push = self._train_epoch_protoclr(epoch)
+            t_loss, t_sc, t_push, t_pair = self._train_epoch_protoclr(epoch)
             v_loss, macro_f1, parasite_f1 = self._val_epoch_protoclr()
             monitor = self._select_monitor(macro_f1, parasite_f1)
 
@@ -596,7 +619,7 @@ class TrainerV2SinglePhase:
                 parasite_f1,
                 monitor,
                 alpha=cfg.PROTOCLR_ALPHA,
-                extra=f"SC:{t_sc:.4f} push:{t_push:.4f}",
+                extra=f"SC:{t_sc:.4f} push:{t_push:.4f} pair:{t_pair:.4f}",
             )
 
             # [BUGFIX-1] Reset es counter AFTER saving best_state, not inside the if-block
@@ -611,9 +634,10 @@ class TrainerV2SinglePhase:
         """Combined SupCon + CE + PushLoss for ProtoCLR."""
         cfg = self.cfg
         alpha = cfg.PROTOCLR_ALPHA
+        pair_weight = cfg.PAIR_LOSS_WEIGHT_P2 if cfg.ENABLE_TA_TJ_PAIR_LOSS else 0.0
 
         self.model.train()
-        total_loss, total_sc, total_push, n = 0.0, 0.0, 0.0, 0
+        total_loss, total_sc, total_push, total_pair, n = 0.0, 0.0, 0.0, 0.0, 0
 
         for imgs, labels in self.train_loader:
             imgs, labels = imgs.to(self.device), labels.to(self.device)
@@ -625,7 +649,8 @@ class TrainerV2SinglePhase:
                 l_sc = self.supcon_loss(proj_feats, labels)
                 l_clf = self.clf_loss(logits, labels)
                 l_push = self.push_loss(self.model.clf_head.prototypes)
-                loss = alpha * l_sc + (1.0 - alpha) * l_clf + l_push
+                l_pair = self.pair_loss(logits, labels) if pair_weight > 0 else logits.new_zeros(())
+                loss = alpha * l_sc + (1.0 - alpha) * l_clf + l_push + pair_weight * l_pair
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -636,9 +661,10 @@ class TrainerV2SinglePhase:
             total_loss += loss.item()
             total_sc += l_sc.item()
             total_push += l_push.item()
+            total_pair += l_pair.item()
             n += 1
 
-        return total_loss / max(n, 1), total_sc / max(n, 1), total_push / max(n, 1)
+        return total_loss / max(n, 1), total_sc / max(n, 1), total_push / max(n, 1), total_pair / max(n, 1)
 
     @torch.no_grad()
     def _val_epoch_protoclr(self):
@@ -691,6 +717,11 @@ class TrainerV2SinglePhase:
         print(
             f"  P2 cfg: alpha={cfg.PROTOCLR_ALPHA}, head_lr={cfg.PROTOCLR_LR_HEAD}, "
             f"back_lr={cfg.PROTOCLR_LR_BACK}, push={cfg.PUSH_WEIGHT}, metric={cfg.BEST_MODEL_METRIC}"
+        )
+        print(
+            f"  Pair TA->TJ: {cfg.ENABLE_TA_TJ_PAIR_LOSS} "
+            f"(TA={cfg.TA_CLASS_IDX}, TJ={cfg.TJ_CLASS_IDX}, margin={cfg.PAIR_LOSS_MARGIN}, "
+            f"w_p1={cfg.PAIR_LOSS_WEIGHT_P1}, w_p2={cfg.PAIR_LOSS_WEIGHT_P2})"
         )
         print(f"  Classes: {cfg.NUM_CLASSES} | Imbalance: {self.class_counts}")
         print(f"{'='*60}")

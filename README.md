@@ -59,8 +59,8 @@ L = α × SupConLoss(z, labels) + (1-α) × DynamicFocalLoss(logits, labels)
 
 | Index | Name | Type |
 |-------|------|------|
-| 0 | TA | Parasite (Trophozoite/Ring Asexual) |
-| 1 | TJ | Parasite (Trophozoite Juvenile) |
+| 0 | TJ | Parasite  |
+| 1 | TA | Parasite  |
 | 2 | S  | Parasite (Schizont) |
 | 3 | G  | Parasite (Gametocyte) |
 | 4 | Unparasitized | Healthy |
